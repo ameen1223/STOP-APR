@@ -1,0 +1,121 @@
+{
+  "phase": "07_future_information_free_replay_v2",
+  "status": "COMPLETED",
+  "decision_guard": "PASS: STOP evaluated at all observed states; no use of true future event count in decision eligibility.",
+  "model_unchanged_from_06": true,
+  "retrained_per_split": true,
+  "validation_tuned": true,
+  "baselines_use_identical_corrected_replay": true,
+  "ablation_scores": {
+    "outcome_only": "1 - p_seq (thresholded; equivalent to SequentialProbHGB)",
+    "burden_only": "pred_remaining (thresholded)",
+    "combined": "pred_remaining * (1 - p_seq)"
+  },
+  "bootstrap_replicates": 2000,
+  "dataset": {
+    "decision_ready_prs": 9217,
+    "states": 53776,
+    "repositories": 1294,
+    "zero_future_event_states_included_for_decision": 9217,
+    "one_final_state_per_pr": true,
+    "decision_requires_true_future_event_count": false,
+    "decision_uses_only": [
+      "predicted scores or observed decision index"
+    ],
+    "label_remaining_events_used_only_after_action": true
+  },
+  "repo_disjoint": {
+    "comparisons": 9,
+    "target_compliant": 8,
+    "wins": 7,
+    "ties": 0,
+    "losses": 2,
+    "mean_gain_pp": 3.1286467596264558,
+    "median_gain_pp": 2.1964185786233914,
+    "positive_cluster_ci": 5,
+    "mean_avoided_event_rate": 0.09497799836379167,
+    "mean_preservation": 0.958454479653003,
+    "last_recorded_event_stops": 11,
+    "merged_last_recorded_event_stops": 2
+  },
+  "strict_temporal": {
+    "comparisons": 3,
+    "target_compliant": 0,
+    "wins": 0,
+    "ties": 0,
+    "losses": 3,
+    "mean_gain_pp": -0.9280661203334034,
+    "median_gain_pp": -0.7564614414793016,
+    "positive_cluster_ci": 0,
+    "mean_avoided_event_rate": 0.11161308398122856,
+    "mean_preservation": 0.9282888229475766,
+    "last_recorded_event_stops": 5,
+    "merged_last_recorded_event_stops": 1
+  },
+  "leave_one_agent_out": {
+    "comparisons": 15,
+    "target_compliant": 10,
+    "wins": 6,
+    "ties": 1,
+    "losses": 8,
+    "mean_gain_pp": 2.5101793464090436,
+    "median_gain_pp": -0.08564576909900651,
+    "positive_cluster_ci": 3,
+    "mean_avoided_event_rate": 0.05973655512551991,
+    "mean_preservation": 0.9558236500932568,
+    "last_recorded_event_stops": 21,
+    "merged_last_recorded_event_stops": 9
+  },
+  "held_out_agent_families": [
+    "Claude_Code",
+    "Copilot",
+    "Cursor",
+    "Devin",
+    "OpenAI_Codex"
+  ],
+  "ablation_repo_disjoint": {
+    "burden_only": {
+      "comparisons": 9,
+      "full_wins": 5,
+      "mean_gain_pp": 1.264341799811359,
+      "positive_cluster_ci": 3
+    },
+    "outcome_only": {
+      "comparisons": 9,
+      "full_wins": 7,
+      "mean_gain_pp": 4.379985266241544,
+      "positive_cluster_ci": 6
+    }
+  },
+  "phase06_comparison": {
+    "available": true,
+    "old_new_matched_comparisons": 27,
+    "mean_preservation_change_pp": -0.028793757652604238,
+    "mean_avoided_event_change_pp": 4.2471612325318735e-15
+  },
+  "temporal_audit": {
+    "cut_train_validation": "2025-06-17 01:44:15+00:00",
+    "cut_validation_test": "2025-07-07 02:30:59+00:00",
+    "original_creation_split_train_prs_crossing_validation_start": 434,
+    "original_creation_split_validation_prs_crossing_test_start": 322,
+    "strict_train_prs": 5096,
+    "strict_validation_prs": 1521,
+    "strict_test_prs": 1844,
+    "excluded_train_boundary_crossers": 434,
+    "excluded_validation_boundary_crossers": 322,
+    "strict_train_terminal_before_validation_start": true,
+    "strict_validation_terminal_before_test_start": true
+  },
+  "script_sha256": {
+    "phase02": "580ccb209404449527f5c8d9d07e1ffe23423ceb2b20892bfd0dc038529810b6",
+    "phase06": "cbd95c8c632b2c3a4f471d113f9e90feb69c2ca48f92056b302f560a441c4ba3",
+    "phase07": "fc1c2918050aea1fab1a1165fbb44f89350a0324aa9a5c1efa6577816b903712"
+  },
+  "input_sha256": {
+    "aidev_pull_request.parquet": "08f520b5ef36b6281f82090db09ac14aefc3534ee113886e7bc85131fd8d214c",
+    "aidev_pr_reviews.parquet": "94051ff602c0ac560dbbc6b34826c1ec1353277d33744718443bc9f3b0532afa",
+    "aidev_pr_comments.parquet": "fa208bafadd5196c6ff414270da4d33a9b13fb65fea47207920ee6df070bf316",
+    "aidev_pr_timeline.parquet": "9f45c52c0a7ffa4395ea6c7ce5beb993b3dfb2425ef3848c6d28e2e96471a6f8"
+  },
+  "claim_guard": "Observational replay of recorded future events; empirical calibration, not a deployment guarantee or measured reviewer-time savings."
+}

@@ -1,0 +1,409 @@
+{
+  "status": "COMPLETE",
+  "stage": "08_final_evidence_without_test_reselection",
+  "integrity": {
+    "source_and_data": {
+      "02_STOP_APR_FullProtocol.py": {
+        "matched": true,
+        "sha256": "580ccb209404449527f5c8d9d07e1ffe23423ceb2b20892bfd0dc038529810b6"
+      },
+      "06_STOP_APR_EmpiricalFinal.py": {
+        "matched": true,
+        "sha256": "cbd95c8c632b2c3a4f471d113f9e90feb69c2ca48f92056b302f560a441c4ba3"
+      },
+      "07_STOP_APR_LeakageFreeAblation.py": {
+        "matched": true,
+        "sha256": "fc1c2918050aea1fab1a1165fbb44f89350a0324aa9a5c1efa6577816b903712"
+      },
+      "aidev_pull_request.parquet": {
+        "matched": true,
+        "sha256": "08f520b5ef36b6281f82090db09ac14aefc3534ee113886e7bc85131fd8d214c"
+      },
+      "aidev_pr_reviews.parquet": {
+        "matched": true,
+        "sha256": "94051ff602c0ac560dbbc6b34826c1ec1353277d33744718443bc9f3b0532afa"
+      },
+      "aidev_pr_comments.parquet": {
+        "matched": true,
+        "sha256": "fa208bafadd5196c6ff414270da4d33a9b13fb65fea47207920ee6df070bf316"
+      },
+      "aidev_pr_timeline.parquet": {
+        "matched": true,
+        "sha256": "9f45c52c0a7ffa4395ea6c7ce5beb993b3dfb2425ef3848c6d28e2e96471a6f8"
+      }
+    },
+    "phase07": {
+      "phase07_reproduced": true,
+      "comparisons": 12,
+      "max_abs_metric_error": 0.0,
+      "baselines_identical": true
+    },
+    "future_information_gate": "PASS"
+  },
+  "dataset": {
+    "decision_ready_prs": 9217,
+    "states": 53776,
+    "repositories": 1294,
+    "zero_future_event_states_included_for_decision": 9217,
+    "one_final_state_per_pr": true,
+    "decision_requires_true_future_event_count": false,
+    "decision_uses_only": [
+      "predicted scores or observed decision index"
+    ],
+    "label_remaining_events_used_only_after_action": true
+  },
+  "cohort_overall": [
+    {
+      "cohort": "0 interactions",
+      "prs": 18235,
+      "merged_prs": 15411,
+      "repositories": 1177,
+      "historical_merge_rate": 0.8451329860159035
+    },
+    {
+      "cohort": "1 interaction",
+      "prs": 3832,
+      "merged_prs": 2586,
+      "repositories": 895,
+      "historical_merge_rate": 0.6748434237995825
+    },
+    {
+      "cohort": "2+ interactions",
+      "prs": 9217,
+      "merged_prs": 6017,
+      "repositories": 1294,
+      "historical_merge_rate": 0.6528154497124878
+    }
+  ],
+  "primary_frozen": {
+    "cases": 9,
+    "preservation_successes": 8,
+    "positive_deltas": 7,
+    "all_mean_gain_pp": 3.128646759626455,
+    "feasible_cases": 8,
+    "feasible_mean_gain_pp": 2.1712147495974063
+  },
+  "primary_burden_only": {
+    "mean_full_minus_burden_pp": 1.2643417998113593,
+    "mean_full_minus_burden_pp_feasible_cases": 0.39314574139003056
+  },
+  "strict_temporal": {
+    "preservation_successes": 0,
+    "cases": 3
+  },
+  "calibration_sensitivity_temporal": [
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.9,
+      "calibration_preservation": 0.921480144404332,
+      "calibration_avoided_event_rate": 0.1582345191040843,
+      "test_preservation": 0.8694362017804154,
+      "test_avoided_event_rate": 0.1947888211809203,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 253,
+      "parameter": 1.7662236686294484
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.91,
+      "calibration_preservation": 0.921480144404332,
+      "calibration_avoided_event_rate": 0.1582345191040843,
+      "test_preservation": 0.8694362017804154,
+      "test_avoided_event_rate": 0.1947888211809203,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 253,
+      "parameter": 1.7662236686294484
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.03,
+      "effective_validation_target": 0.93,
+      "calibration_preservation": 0.9359205776173284,
+      "calibration_avoided_event_rate": 0.1292490118577075,
+      "test_preservation": 0.8998516320474778,
+      "test_avoided_event_rate": 0.1455137633956713,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 189,
+      "parameter": 1.894810383376736
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.95,
+      "calibration_preservation": 0.953971119133574,
+      "calibration_avoided_event_rate": 0.0910408432147562,
+      "test_preservation": 0.9376854599406528,
+      "test_avoided_event_rate": 0.0972893465013658,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 118,
+      "parameter": 2.112519185049784
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.96,
+      "calibration_preservation": 0.9810469314079422,
+      "calibration_avoided_event_rate": 0.0384716732542819,
+      "test_preservation": 0.9777448071216616,
+      "test_avoided_event_rate": 0.0427610842613994,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 45,
+      "parameter": 2.556606666701
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.03,
+      "effective_validation_target": 0.98,
+      "calibration_preservation": 0.9810469314079422,
+      "calibration_avoided_event_rate": 0.0384716732542819,
+      "test_preservation": 0.9777448071216616,
+      "test_avoided_event_rate": 0.0427610842613994,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 45,
+      "parameter": 2.556606666701
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.98,
+      "calibration_preservation": 0.9810469314079422,
+      "calibration_avoided_event_rate": 0.0384716732542819,
+      "test_preservation": 0.9777448071216616,
+      "test_avoided_event_rate": 0.0427610842613994,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 45,
+      "parameter": 2.556606666701
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.99,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "all_validation",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.03,
+      "effective_validation_target": 1.0,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.9,
+      "calibration_preservation": 0.9058219178082192,
+      "calibration_avoided_event_rate": 0.1721401204159824,
+      "test_preservation": 0.862759643916914,
+      "test_avoided_event_rate": 0.2069762555158646,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 272,
+      "parameter": 1.735554204974921
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.91,
+      "calibration_preservation": 0.922945205479452,
+      "calibration_avoided_event_rate": 0.1461412151067323,
+      "test_preservation": 0.8954005934718101,
+      "test_avoided_event_rate": 0.1536036982559361,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 201,
+      "parameter": 1.852095032474723
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.9,
+      "validation_margin": 0.03,
+      "effective_validation_target": 0.93,
+      "calibration_preservation": 0.940068493150685,
+      "calibration_avoided_event_rate": 0.1157635467980295,
+      "test_preservation": 0.9161721068249258,
+      "test_avoided_event_rate": 0.1277579323387266,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 158,
+      "parameter": 2.004597066826017
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.95,
+      "calibration_preservation": 0.9589041095890412,
+      "calibration_avoided_event_rate": 0.0859332238642583,
+      "test_preservation": 0.9451038575667656,
+      "test_avoided_event_rate": 0.0868880016810254,
+      "test_meets_requested_target": false,
+      "n_test_prs": 1844,
+      "stopped_prs": 105,
+      "parameter": 2.1747265880221454
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.96,
+      "calibration_preservation": 0.9794520547945206,
+      "calibration_avoided_event_rate": 0.0325670498084291,
+      "test_preservation": 0.9777448071216616,
+      "test_avoided_event_rate": 0.0426560201723051,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 44,
+      "parameter": 2.55916367251491
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.95,
+      "validation_margin": 0.03,
+      "effective_validation_target": 0.98,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.0,
+      "effective_validation_target": 0.98,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.01,
+      "effective_validation_target": 0.99,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    },
+    {
+      "split": "TEMPORAL_STRICT",
+      "seed": 2026,
+      "calibration_window": "most_recent_validation_half",
+      "policy": "STOP_APR_PC",
+      "target_preservation": 0.98,
+      "validation_margin": 0.03,
+      "effective_validation_target": 1.0,
+      "calibration_preservation": 1.0,
+      "calibration_avoided_event_rate": 0.0,
+      "test_preservation": 1.0,
+      "test_avoided_event_rate": 0.0,
+      "test_meets_requested_target": true,
+      "n_test_prs": 1844,
+      "stopped_prs": 0,
+      "parameter": null
+    }
+  ],
+  "claims_guard": [
+    "Frozen Phase07 results are not replaced by selecting favourable test outcomes.",
+    "Calibration margins and window diagnostics are descriptive sensitivity analyses.",
+    "One-event extension is an exposure/scope audit, not deployment validation.",
+    "Observational replay is not a causal intervention or reviewer-time saving.",
+    "Subgroup diagnostics are descriptive; no inferential subgroup claims."
+  ]
+}

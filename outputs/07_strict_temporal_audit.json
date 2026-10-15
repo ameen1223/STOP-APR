@@ -1,0 +1,13 @@
+{
+  "cut_train_validation": "2025-06-17 01:44:15+00:00",
+  "cut_validation_test": "2025-07-07 02:30:59+00:00",
+  "original_creation_split_train_prs_crossing_validation_start": 434,
+  "original_creation_split_validation_prs_crossing_test_start": 322,
+  "strict_train_prs": 5096,
+  "strict_validation_prs": 1521,
+  "strict_test_prs": 1844,
+  "excluded_train_boundary_crossers": 434,
+  "excluded_validation_boundary_crossers": 322,
+  "strict_train_terminal_before_validation_start": true,
+  "strict_validation_terminal_before_test_start": true
+}

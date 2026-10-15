@@ -1,0 +1,16 @@
+cohort,agent,prs,merged_prs,repositories,historical_merge_rate
+0 interactions,Claude_Code,133,103,60,0.7744360902255639
+0 interactions,Copilot,836,152,333,0.18181818181818182
+0 interactions,Cursor,311,219,107,0.7041800643086816
+0 interactions,Devin,18,8,12,0.4444444444444444
+0 interactions,OpenAI_Codex,16937,14929,698,0.8814429946271477
+1 interaction,Claude_Code,81,48,56,0.5925925925925926
+1 interaction,Copilot,487,173,267,0.35523613963039014
+1 interaction,Cursor,372,285,118,0.7661290322580645
+1 interaction,Devin,679,368,110,0.5419734904270986
+1 interaction,OpenAI_Codex,2213,1712,401,0.7736104835065521
+2+ interactions,Claude_Code,166,120,91,0.7228915662650602
+2+ interactions,Copilot,2568,1814,585,0.706386292834891
+2+ interactions,Cursor,664,501,149,0.7545180722891566
+2+ interactions,Devin,3976,2219,247,0.5580985915492958
+2+ interactions,OpenAI_Codex,1843,1363,363,0.7395550732501357
