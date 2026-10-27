@@ -1,5 +1,5 @@
-# Single-file OrderSafe-K8s GitHub Actions runtime gate.
-# No commands execute on the user's Windows PC.
+# OrderSafe-K8s engine gate: complete, audit-friendly workflow.
+# Isolated GitHub runner only. Does not touch any existing user cluster.
 name: OrderSafe Kyverno Real Engine Gate
 on:
   workflow_dispatch:
@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
-      - name: Prepare evidence folder
+      - name: Create evidence folder
         shell: bash
         run: mkdir -p evidence
-      - name: Create isolated Kubernetes v1.35.5 cluster
+      - name: Create isolated Kubernetes cluster
         uses: helm/kind-action@v1
         with:
           version: v0.32.0
@@ -25,7 +25,7 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: v3.20.2
-      - name: Run three-stage real engine gate
+      - name: Test isolated, paired, and workaround policy cases
         shell: bash
         run: |
           #!/usr/bin/env bash
@@ -34,41 +34,45 @@ jobs:
           phase=starting
           status=BLOCKED_OR_FAILED
           reason=NOT_COMPLETED
+          runtime_verified=false
           finish() {
-            rc=$?
-            if [ "$status" = 'BLOCKED_OR_FAILED' ]; then
-              reason="ERROR_IN_${phase}"
-            fi
-            printf '{"status":"%s","reason":"%s","phase":"%s","exit_code":%s,"runtime_verified":%s}\n' \
-              "$status" "$reason" "$phase" "$rc" "$([ "$status" = 'RUNTIME_COMPLETE' ] && echo true || echo false)" > evidence/summary.json
+            local rc=$?
+            if [ "$status" = BLOCKED_OR_FAILED ]; then reason="ERROR_IN_${phase}"; fi
+            jq -n --arg status "$status" --arg reason "$reason" --arg phase "$phase" \
+              --argjson exit_code "$rc" --argjson runtime_verified "$runtime_verified" \
+              '{status:$status, reason:$reason, phase:$phase, exit_code:$exit_code, runtime_verified:$runtime_verified}' \
+              > evidence/summary.json
             echo "ORDER_SAFE_STATUS=$status; REASON=$reason; PHASE=$phase; EXIT=$rc"
           }
           trap finish EXIT
 
-          echo 'OrderSafe cloud real-engine gate: Kyverno 1.18.1 / Kubernetes 1.35.5'
-          echo 'Source: https://github.com/kyverno/policies/issues/1519'
-          echo 'Simplified probe; NOT a verbatim reproduction of the issue.'
+          # Real, isolated Kubernetes and Kyverno runtime; no existing user cluster is touched.
           phase=cluster_preflight
-          kubectl version -o json > evidence/kubernetes_version.json
-          helm version --short > evidence/helm_version.txt
+          kubectl version -o json > evidence/kubernetes-version.json
           kubectl get nodes -o wide > evidence/nodes.txt
+          helm version --short > evidence/helm-version.txt
 
           phase=install_kyverno
           helm repo add kyverno https://kyverno.github.io/kyverno/
           helm repo update kyverno
-          helm install kyverno kyverno/kyverno \
-            --namespace kyverno --create-namespace --version 3.8.1 \
-            --wait --timeout 12m
-          helm list -n kyverno -o json > evidence/helm_releases.json
-          kubectl get pods -n kyverno -o wide > evidence/kyverno_pods.txt
+          helm install kyverno kyverno/kyverno --namespace kyverno --create-namespace \
+            --version 3.8.1 --wait --timeout 12m
+          helm list -n kyverno -o json > evidence/helm-releases.json
+          kubectl get pods -n kyverno -o wide > evidence/kyverno-pods.txt
+          kubectl wait --for=condition=Established --timeout=120s crd/mutatingpolicies.policies.kyverno.io
 
-          phase=policy_setup
+          phase=create_test_namespace
+          NS=ordersafe-gate
+          kubectl create namespace "$NS"
+
+          # Policy B: mutate UPDATE on specifically labeled ConfigMaps.
           cat > /tmp/ordersafe-policy-b.yaml <<'POLICY_B'
           apiVersion: policies.kyverno.io/v1
           kind: MutatingPolicy
           metadata:
             name: ordersafe-b-watch-configmaps
           spec:
+            failurePolicy: Fail
             matchConstraints:
               resourceRules:
                 - apiGroups: ['']
@@ -84,13 +88,9 @@ jobs:
                   expression: >
                     Object{
                       metadata: Object.metadata{
-                        annotations: {"ordersafe.io/mutated": "yes"}
+                        annotations: {"ordersafe.io/mut-b": "yes"}
                       }
                     }
           POLICY_B
-          cat > /tmp/ordersafe-policy-a.yaml <<'POLICY_A'
-          apiVersion: policies.kyverno.io/v1
-          kind: MutatingPolicy
-          metadata:
-            name: ordersafe-a-rbac
-          spec:
+
+          # Policy A: distinct resource rules and objectSelector, as in the reported issue.
