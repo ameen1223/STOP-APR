@@ -1,0 +1,96 @@
+# Single-file OrderSafe-K8s GitHub Actions runtime gate.
+# No commands execute on the user's Windows PC.
+name: OrderSafe Kyverno Real Engine Gate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ordersafe-real-engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Prepare evidence folder
+        shell: bash
+        run: mkdir -p evidence
+      - name: Create isolated Kubernetes v1.35.5 cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.32.0
+          kubectl_version: v1.35.5
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+          cluster_name: ordersafe-engine
+          wait: 180s
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
+      - name: Run three-stage real engine gate
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p evidence
+          phase=starting
+          status=BLOCKED_OR_FAILED
+          reason=NOT_COMPLETED
+          finish() {
+            rc=$?
+            if [ "$status" = 'BLOCKED_OR_FAILED' ]; then
+              reason="ERROR_IN_${phase}"
+            fi
+            printf '{"status":"%s","reason":"%s","phase":"%s","exit_code":%s,"runtime_verified":%s}\n' \
+              "$status" "$reason" "$phase" "$rc" "$([ "$status" = 'RUNTIME_COMPLETE' ] && echo true || echo false)" > evidence/summary.json
+            echo "ORDER_SAFE_STATUS=$status; REASON=$reason; PHASE=$phase; EXIT=$rc"
+          }
+          trap finish EXIT
+
+          echo 'OrderSafe cloud real-engine gate: Kyverno 1.18.1 / Kubernetes 1.35.5'
+          echo 'Source: https://github.com/kyverno/policies/issues/1519'
+          echo 'Simplified probe; NOT a verbatim reproduction of the issue.'
+          phase=cluster_preflight
+          kubectl version -o json > evidence/kubernetes_version.json
+          helm version --short > evidence/helm_version.txt
+          kubectl get nodes -o wide > evidence/nodes.txt
+
+          phase=install_kyverno
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update kyverno
+          helm install kyverno kyverno/kyverno \
+            --namespace kyverno --create-namespace --version 3.8.1 \
+            --wait --timeout 12m
+          helm list -n kyverno -o json > evidence/helm_releases.json
+          kubectl get pods -n kyverno -o wide > evidence/kyverno_pods.txt
+
+          phase=policy_setup
+          cat > /tmp/ordersafe-policy-b.yaml <<'POLICY_B'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: ordersafe-b-watch-configmaps
+          spec:
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['']
+                  apiVersions: ['v1']
+                  operations: ['UPDATE']
+                  resources: ['configmaps']
+              objectSelector:
+                matchLabels:
+                  ordersafe.io/watch: 'true'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{
+                      metadata: Object.metadata{
+                        annotations: {"ordersafe.io/mutated": "yes"}
+                      }
+                    }
+          POLICY_B
+          cat > /tmp/ordersafe-policy-a.yaml <<'POLICY_A'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: ordersafe-a-rbac
+          spec:
