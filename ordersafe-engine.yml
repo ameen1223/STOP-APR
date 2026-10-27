@@ -1,0 +1,127 @@
+                matchLabels:
+                  ordersafe.io/group: 'A'
+            matchConditions:
+              - name: force-separate
+                expression: 'true'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{
+                      metadata: Object.metadata{
+                        annotations: {"ordersafe.io/mutated": "A"}
+                      }
+                    }
+          POLICY_SEPARATE
+          cat > /tmp/ordersafe-configmap.yaml <<'CONFIGMAP'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            namespace: ordersafe-test
+            name: ordersafe-cm
+            labels:
+              ordersafe.io/watch: 'true'
+          data:
+            rev: init
+          CONFIGMAP
+          cp /tmp/ordersafe-*.yaml evidence/
+          kubectl create namespace ordersafe-test
+
+          wait_policy_webhook() {
+            local policy="$1"
+            local seen=0
+            for i in $(seq 1 40); do
+              if kubectl get mutatingwebhookconfigurations -o json | grep -q "$policy"; then
+                seen=1
+                break
+              fi
+              sleep 4
+            done
+            if [ "$seen" -eq 0 ]; then
+              echo "Policy $policy did not appear in webhook configuration" >&2
+              kubectl get mutatingwebhookconfigurations -o yaml > evidence/webhooks_registration_failed.yaml
+              return 1
+            fi
+            sleep 12
+          }
+
+          observe_stage() {
+            local stage="$1"
+            echo "=== $stage ==="
+            kubectl -n ordersafe-test delete configmap ordersafe-cm --ignore-not-found
+            kubectl apply -f /tmp/ordersafe-configmap.yaml
+            kubectl -n ordersafe-test annotate configmap ordersafe-cm "ordersafe.io/probe=$stage" --overwrite
+            kubectl -n ordersafe-test get configmap ordersafe-cm -o json > "evidence/${stage}_configmap.json"
+            kubectl get mutatingwebhookconfigurations -o json > "evidence/${stage}_webhooks.json"
+            kubectl get mutatingpolicies -o yaml > "evidence/${stage}_policies.yaml"
+            python3 - "$stage" <<'OBSERVE_PY'
+          import json,sys
+          s=sys.argv[1]
+          x=json.load(open('evidence/'+s+'_configmap.json',encoding='utf8'))
+          a=x.get('metadata',{}).get('annotations') or {}
+          print(s+': mutation received = '+str(a.get('ordersafe.io/mutated')=='yes'))
+          OBSERVE_PY
+          }
+
+          phase=baseline
+          kubectl apply -f /tmp/ordersafe-policy-b.yaml
+          wait_policy_webhook ordersafe-b-watch-configmaps
+          observe_stage baseline
+          python3 - <<'CONTROL_PY'
+          import json
+          x=json.load(open('evidence/baseline_configmap.json',encoding='utf8'))
+          a=x.get('metadata',{}).get('annotations') or {}
+          if a.get('ordersafe.io/mutated')!='yes':
+              raise SystemExit('INVALID BASELINE: policy B alone did not mutate the test ConfigMap')
+          CONTROL_PY
+
+          phase=composed
+          kubectl apply -f /tmp/ordersafe-policy-a.yaml
+          wait_policy_webhook ordersafe-a-rbac
+          observe_stage composed
+
+          phase=separated
+          kubectl apply -f /tmp/ordersafe-policy-a-separated.yaml
+          wait_policy_webhook ordersafe-a-rbac
+          observe_stage separated
+
+          phase=analysis
+          python3 - <<'ANALYZE_PY'
+          import json
+          out={
+            'test': 'simplified_Kyverno_1.18.1_composition_probe',
+            'source_issue': 'https://github.com/kyverno/policies/issues/1519',
+            'verbatim_reproduction': False,
+            'runtime_complete': True,
+          }
+          for stage in ('baseline','composed','separated'):
+              obj=json.load(open('evidence/'+stage+'_configmap.json',encoding='utf8'))
+              ann=obj.get('metadata',{}).get('annotations') or {}
+              out[stage+'_B_mutated']=ann.get('ordersafe.io/mutated')=='yes'
+          out['composition_regression_witness']=(out['baseline_B_mutated'] and
+              not out['composed_B_mutated'] and out['separated_B_mutated'])
+          out['interpretation']='A negative result does not refute the upstream issue; a positive result is a known-behavior reproduction, not a novel algorithm.'
+          with open('evidence/runtime_comparison.json','w',encoding='utf8') as f:
+              json.dump(out,f,indent=2)
+          print(json.dumps(out,indent=2))
+          ANALYZE_PY
+          status=RUNTIME_COMPLETE
+          reason=THREE_STAGES_OBSERVED
+          phase=completed
+      - name: Write setup-failure summary if necessary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          if [ ! -f evidence/summary.json ]; then
+            printf '%s\n' '{"status":"BLOCKED","reason":"KIND_OR_HELM_SETUP_FAILED","runtime_verified":false}' > evidence/summary.json
+          fi
+          cat evidence/summary.json
+      - name: Upload all evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderSafe_EngineGate_Results
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
