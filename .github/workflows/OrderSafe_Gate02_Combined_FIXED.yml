@@ -1,0 +1,605 @@
+# Self-contained, single-run OrderSafe Gate02: model checks + real-engine experiments.
+# No downloads from untrusted scripts and no access to user's Kubernetes clusters.
+# Distinguishes executable feasibility evidence from novelty, which remains unproven.
+name: OrderSafe Gate02 Combined Evidence
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  combined-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Create evidence directory and model verifier
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p evidence
+          cat > /tmp/ordersafe-analyzer.py <<'ORDERSAFE_PYTHON'
+          #!/usr/bin/env python3
+          """OrderSafe selector-coverage feasibility verifier, deliberately narrow and fail-closed.
+
+          Scope: finite API tuples, Kubernetes label selectors, policy -> webhook prefilter reachability.
+          Does not prove mutation execution, arbitrary CEL predicates, RBAC readiness, webhook backend routing,
+          policy order, or cross-admission behavior. A counterexample is valid only for declared scope.
+          """
+          import argparse
+          import itertools
+          import json
+          import os
+          import time
+          from collections import Counter
+
+          LIMIT = 200000
+          OTHER = 'ordersafe-other-value'
+
+          class Unsupported(Exception):
+              pass
+
+
+          def selector(sel, labels):
+              """Return Kubernetes LabelSelector match for a single label dictionary."""
+              if sel is None:
+                  return True
+              if not isinstance(sel, dict):
+                  raise Unsupported('selector_not_object')
+              for k,v in sel.items():
+                  if k not in ('matchLabels','matchExpressions'):
+                      raise Unsupported('unsupported_selector_field:'+k)
+              for k, v in (sel.get('matchLabels') or {}).items():
+                  if labels.get(k) != v:
+                      return False
+              for ex in sel.get('matchExpressions') or []:
+                  k,op,vs=ex.get('key'),ex.get('operator'),ex.get('values',[])
+                  if not isinstance(k,str) or not isinstance(vs,list):
+                      raise Unsupported('malformed_label_expression')
+                  present = k in labels
+                  if op=='In': valid=present and labels[k] in vs
+                  elif op=='NotIn': valid=(not present) or labels[k] not in vs
+                  elif op=='Exists': valid=present
+                  elif op=='DoesNotExist': valid=not present
+                  else: raise Unsupported('unsupported_label_operator:'+str(op))
+                  if not valid:
+                      return False
+              return True
+
+
+          def selector_keys(sel):
+              if sel is None:
+                  return {}
+              if not isinstance(sel,dict):
+                  raise Unsupported('malformed_selector')
+              out={}
+              for k,v in (sel.get('matchLabels') or {}).items():
+                  out.setdefault(k,set()).add(v)
+              for ex in sel.get('matchExpressions') or []:
+                  k=ex.get('key')
+                  if not k or ex.get('operator') not in ('In','NotIn','Exists','DoesNotExist'):
+                      raise Unsupported('unsupported_label_operator')
+                  out.setdefault(k,set()).update(ex.get('values') or [])
+              for k in sel:
+                  if k not in ('matchLabels','matchExpressions'):
+                      raise Unsupported('unsupported_selector_field:'+k)
+              return out
+
+
+          def supported_conditions(conds):
+              for c in conds or []:
+                  if c.get('expression','').strip()!='true':
+                      raise Unsupported('nontrivial_CEL_not_modeled')
+
+
+          def rule_tuples(rules):
+              if not rules:
+                  raise Unsupported('empty_rules')
+              ret=set()
+              for r in rules:
+                  if r.get('scope','*') not in ('*','Namespaced'):
+                      raise Unsupported('cluster_scope_not_modeled')
+                  for group, version, resource, op in itertools.product(r.get('apiGroups',[]),r.get('apiVersions',[]),r.get('resources',[]),r.get('operations',[])):
+                      if not all(isinstance(v,str) and '*' not in v and '/' not in v for v in (group,version,resource,op)):
+                          raise Unsupported('wildcards_or_subresources_not_modeled')
+                      if op not in ('CREATE','UPDATE'):
+                          raise Unsupported('delete_connect_not_modeled')
+                      ret.add((group,version,resource,op))
+              if not ret:
+                  raise Unsupported('empty_rule_expansion')
+              return ret
+
+
+          def request_matches(matcher, req, kind):
+              if req['api'] not in rule_tuples(matcher.get('resourceRules',[])):
+                  return False
+              if kind=='policy':
+                  supported_conditions(matcher.get('_conditions'))
+              if not selector(matcher.get('namespaceSelector'),req['namespace_labels']):
+                  return False
+              obj_sel=matcher.get('objectSelector')
+              # For CREATE there is no old object. For UPDATE either old or new suffices.
+              return selector(obj_sel,req['new_labels']) or (req['old_labels'] is not None and selector(obj_sel,req['old_labels']))
+
+
+          def candidates(policy,hooks):
+              names=policy['metadata']['name']
+              out=[]
+              for w in hooks:
+                  path=w.get('clientConfig',{}).get('service',{}).get('path','')
+                  # the /mpol/... path is Kyverno-specific; do not guess unknown dispatch behavior.
+                  parts=path.split('/')
+                  if len(parts)>2 and parts[1]=='mpol' and names in parts[2:]:
+                      out.append(w)
+              return out
+
+
+          def domains(sels):
+              m={}
+              for s in sels:
+                  for k,v in selector_keys(s).items(): m.setdefault(k,set()).update(v)
+              ans=[]
+              for k in sorted(m):
+                  vals=sorted(m[k])
+                  other=OTHER
+                  while other in vals: other+='x'
+                  ans.append((k,[None]+vals+[other]))
+              return ans
+
+
+          def label_assignments(keys):
+              if not keys:
+                  yield {}
+                  return
+              for xs in itertools.product(*(v for _,v in keys)):
+                  yield {k:v for (k,_),v in zip(keys,xs) if v is not None}
+
+
+          def witness(policy,hooks,limit=LIMIT,namespace='ordersafe-gate'):
+              """Exhaustive finite abstract-domain check; returns minimum-present-label counterexample."""
+              mm=dict(policy.get('spec',{}).get('matchConstraints') or {})
+              supported_conditions(policy.get('spec',{}).get('matchConditions'))
+              mm['_conditions']=policy.get('spec',{}).get('matchConditions')
+              prules=rule_tuples(mm.get('resourceRules',[]))
+              attached=candidates(policy,hooks)
+              for h in attached:
+                  supported_conditions(h.get('matchConditions'))
+                  rule_tuples(h.get('rules',[]))
+              obj_keys=domains([mm.get('objectSelector')]+[w.get('objectSelector') for w in attached])
+              ns_keys=[(k,v) for k,v in domains([mm.get('namespaceSelector')]+[w.get('namespaceSelector') for w in attached]) if k!='kubernetes.io/metadata.name']
+              if len(obj_keys)>7 or len(ns_keys)>5:
+                  raise Unsupported('too_many_keys_for_exact_bounded_search')
+              n_obj=1
+              for k,v in obj_keys: n_obj*=len(v)
+              n_ns=1
+              for k,v in ns_keys: n_ns*=len(v)
+              estimated=sum(n_ns*n_obj*(n_obj if op=='UPDATE' else 1) for _,_,_,op in prules)
+              if estimated>limit: raise Unsupported('finite_state_limit_exceeded:'+str(estimated))
+              tested=0
+              best=None
+              best_cost=None
+              for api in sorted(prules):
+                  for ns_extra in label_assignments(ns_keys):
+                      nslab={'kubernetes.io/metadata.name':namespace,**ns_extra}
+                      for newlab in label_assignments(obj_keys):
+                          oldvals=[None] if api[-1]=='CREATE' else list(label_assignments(obj_keys))
+                          for oldlab in oldvals:
+                              req={'api':api,'namespace_labels':nslab,'new_labels':newlab,'old_labels':oldlab}
+                              tested+=1
+                              if not request_matches(mm,req,'policy'):
+                                  continue
+                              if any(request_matches({'resourceRules':w['rules'], 'namespaceSelector':w.get('namespaceSelector'), 'objectSelector':w.get('objectSelector')},req,'hook') for w in attached):
+                                  continue
+                              cost=len(ns_extra)+len(newlab)+(len(oldlab) if oldlab else 0)
+                              if best is None or (cost, str(req))<(best_cost,str(best)):
+                                  best=req
+                                  best_cost=cost
+                                  if cost==0:
+                                      return {'status':'UNREACHABLE_PREFILTER','request':best,'minimal_present_labels':cost,'states_examined':tested,'states_domain':estimated}
+              if best is not None:
+                  return {'status':'UNREACHABLE_PREFILTER','request':best,'minimal_present_labels':best_cost,'states_examined':tested,'states_domain':estimated}
+              return {'status':'COVERED_IN_SUPPORTED_MODEL','request':None,'states_examined':tested,'states_domain':estimated}
+
+
+          def run(policy_list,webhooks,namespace):
+              results={}
+              for pol in policy_list:
+                  name=pol.get('metadata',{}).get('name','UNKNOWN')
+                  try:
+                      results[name]=witness(pol,webhooks,namespace=namespace)
+                  except Unsupported as e:
+                      results[name]={'status':'UNKNOWN_UNSUPPORTED','reason':str(e)}
+              return results
+
+
+          def check_case(pol,webhooks,expect):
+              got=witness(pol,webhooks)
+              if got['status']!=expect:
+                  raise AssertionError((pol['metadata']['name'],expect,got))
+              return got
+
+
+          def policy(name,resource,op,labels):
+              return {'metadata':{'name':name},'spec':{'matchConstraints':{'resourceRules':[{'apiGroups':[''],'apiVersions':['v1'],'resources':[resource],'operations':[op]}],'objectSelector':{'matchLabels':labels}},'mutations':[]}}
+
+
+          def hook(names,resource,op,labels):
+              return {'clientConfig':{'service':{'path':'/mpol/'+'/'.join(names)}},'rules':[{'apiGroups':[''],'apiVersions':['v1'],'resources':[resource],'operations':[op]}],'objectSelector':{'matchLabels':labels}}
+
+
+          def selftest():
+              cases=0
+              a=policy('a','configmaps','CREATE',{'team':'red'})
+              check_case(a,[hook(['a'],'configmaps','CREATE',{'team':'blue'})],'UNREACHABLE_PREFILTER'); cases+=1
+              check_case(a,[hook(['a'],'configmaps','CREATE',{'team':'red'})],'COVERED_IN_SUPPORTED_MODEL');cases+=1
+              check_case(a,[hook(['a'],'secrets','CREATE',{'team':'red'})],'UNREACHABLE_PREFILTER');cases+=1
+              p=policy('q','configmaps','UPDATE',{'team':'red'})
+              # old/new both evaluated: a webhook selector blue may be missed for old red and new red,
+              # even if some UPDATEs change blue -> red.
+              check_case(p,[hook(['q'],'configmaps','UPDATE',{'team':'blue'})],'UNREACHABLE_PREFILTER');cases+=1
+              check_case(p,[hook(['q'],'configmaps','UPDATE',{})],'COVERED_IN_SUPPORTED_MODEL');cases+=1
+              # A single incoming request can route through two distinct hooks, coverage is their union.
+              check_case(a,[hook(['a'],'configmaps','CREATE',{'team':'blue'}),hook(['a'],'configmaps','CREATE',{'team':'red'})],'COVERED_IN_SUPPORTED_MODEL');cases+=1
+              # K8s In/NotIn and absent: NotIn includes missing keys.
+              assert selector({'matchExpressions':[{'key':'x','operator':'NotIn','values':['a']}]},{})
+              assert not selector({'matchExpressions':[{'key':'x','operator':'In','values':['a']}]},{})
+              assert selector({'matchExpressions':[{'key':'x','operator':'DoesNotExist'}]},{})
+              cases+=3
+              # Truth-table comparison on deterministic small generated finite-domain fixtures.
+              import random
+              rng=random.Random(20261027)
+              for i in range(150):
+                  pk=rng.choice(['group','team','purpose'])
+                  val=rng.choice(['a','b','c'])
+                  pol=policy('trial'+str(i),'configmaps',rng.choice(['CREATE','UPDATE']),{pk:val})
+                  hooks=[]
+                  for j in range(rng.randint(0,3)):
+                      hk=rng.choice(['group','team','purpose'])
+                      hv=rng.choice(['a','b','c'])
+                      hooks.append(hook([pol['metadata']['name']],'configmaps',pol['spec']['matchConstraints']['resourceRules'][0]['operations'][0],{hk:hv}))
+                  out=witness(pol,hooks,limit=LIMIT)
+                  if out['status']=='UNREACHABLE_PREFILTER':
+                      req=out['request']; mm=pol['spec']['matchConstraints']
+                      assert request_matches(mm,req,'policy')
+                      assert not any(request_matches({'resourceRules':w['rules'],'objectSelector':w['objectSelector']},req,'hook') for w in hooks)
+                  elif out['status']!='COVERED_IN_SUPPORTED_MODEL':
+                      raise AssertionError(out)
+                  cases+=1
+              return cases
+
+
+          def main():
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--policies')
+              ap.add_argument('--webhooks')
+              ap.add_argument('--output',default='ordersafe_model.json')
+              ap.add_argument('--selftest',action='store_true')
+              ap.add_argument('--namespace',default='ordersafe-gate')
+              args=ap.parse_args()
+              test_count=selftest()
+              if args.selftest:
+                  result={'selftests_passed':test_count,'scope':'finite K8s label selectors; CREATE/UPDATE; matched /mpol/... paths; no CEL other than true'}
+              else:
+                  if not args.policies or not args.webhooks: ap.error('both --policies and --webhooks required')
+                  with open(args.policies) as f: policies=json.load(f)['items']
+                  with open(args.webhooks) as f: wh=json.load(f)['items']
+                  hooks=[h for cfg in wh for h in cfg.get('webhooks',[])]
+                  result={'selftests_passed':test_count,'results':run(policies,hooks,args.namespace),'scope':'finite K8s label selectors; CREATE/UPDATE; matched /mpol/... paths; no CEL other than true'}
+              with open(args.output,'w') as f: json.dump(result,f,indent=2,sort_keys=True)
+              print(json.dumps({ 'tests':test_count, 'classifications':{k:v['status'] for k,v in result.get('results',{}).items()}},sort_keys=True))
+
+          if __name__=='__main__':main()
+          ORDERSAFE_PYTHON
+          python /tmp/ordersafe-analyzer.py --selftest --output evidence/model-selftest.json
+      - name: Create fresh, isolated Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.32.0
+          kubectl_version: v1.35.5
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+          cluster_name: ordersafe-gate02
+          wait: 180s
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
+      - name: Run Kyverno 1.19.2 baselines, composition, repair, and selector controls
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p evidence
+          phase=init
+          status=INCOMPLETE
+          reason=NO_DECISION
+          runtime_verified=false
+          finish() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then status=BLOCKED; reason="FAILED_IN_${phase}"; fi
+            jq -n --arg status "$status" --arg reason "$reason" --arg phase "$phase" --argjson exit_code "$rc" --argjson verified "$runtime_verified" \
+              '{status:$status,reason:$reason,phase:$phase,exit_code:$exit_code,runtime_verified:$verified}' > evidence/runtime-status.json
+            printf 'STATUS=%s REASON=%s PHASE=%s EXIT=%s\n' "$status" "$reason" "$phase" "$rc"
+          }
+          trap finish EXIT
+
+          phase=preflight
+          kubectl version -o json > evidence/k8s-version.json
+          kubectl get nodes -o wide > evidence/nodes.txt
+          helm version --short > evidence/helm-version.txt
+
+          phase=install_kyverno
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update kyverno
+          helm install kyverno kyverno/kyverno -n kyverno --create-namespace \
+            --version 3.9.2 --wait --timeout 12m
+          helm list -n kyverno -o json > evidence/helm-releases.json
+          kubectl wait --for=condition=Established --timeout=120s crd/mutatingpolicies.policies.kyverno.io
+          kubectl -n kyverno get pods -o wide > evidence/kyverno-pods.txt
+
+          phase=policy_setup
+          NS=ordersafe-gate2
+          kubectl create namespace "$NS"
+          # Two independent namespaced resource types avoid previous RBAC readiness ambiguity.
+          cat > /tmp/order2-a.yaml <<'POLICY_A'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: order2-a-configmaps
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['']
+                  apiVersions: ['v1']
+                  operations: ['CREATE']
+                  resources: ['configmaps']
+              objectSelector:
+                matchLabels:
+                  ordersafe.io/alpha: 'yes'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{metadata: Object.metadata{annotations:{"ordersafe.io/mut-a":"yes"}}}
+          POLICY_A
+          cat > /tmp/order2-b.yaml <<'POLICY_B'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: order2-b-secrets
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['']
+                  apiVersions: ['v1']
+                  operations: ['CREATE']
+                  resources: ['secrets']
+              objectSelector:
+                matchLabels:
+                  ordersafe.io/beta: 'yes'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{metadata: Object.metadata{annotations:{"ordersafe.io/mut-b":"yes"}}}
+          POLICY_B
+          cat > /tmp/order2-c.yaml <<'POLICY_C'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: order2-c-old-new
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['']
+                  apiVersions: ['v1']
+                  operations: ['UPDATE']
+                  resources: ['configmaps']
+              objectSelector:
+                matchLabels:
+                  ordersafe.io/alpha: 'yes'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{metadata: Object.metadata{annotations:{"ordersafe.io/mut-c":"yes"}}}
+          POLICY_C
+          cp /tmp/order2-*.yaml evidence/
+
+          has_hook() {
+            local name="$1"
+            kubectl get mutatingwebhookconfigurations -o json | jq -e --arg n "$name" \
+              '[.items[]? | .webhooks[]? | (.clientConfig.service.path // "") | split("/") | index($n) | select(.!=null)] | length > 0' >/dev/null
+          }
+          wait_hook() {
+            local n="$1" desired="$2"
+            for _ in $(seq 1 40); do
+              if [ "$desired" = present ] && has_hook "$n"; then sleep 4; return 0; fi
+              if [ "$desired" = absent ] && ! has_hook "$n"; then sleep 4; return 0; fi
+              sleep 5
+            done
+            echo "Webhook precondition not met: $n => $desired" >&2
+            return 1
+          }
+          snapshot() {
+            local phase="$1"
+            kubectl get mutatingwebhookconfigurations -o json > "evidence/${phase}-webhooks.json"
+            kubectl get mutatingpolicies.policies.kyverno.io -o json > "evidence/${phase}-policies.json"
+            python /tmp/ordersafe-analyzer.py \
+              --policies "evidence/${phase}-policies.json" \
+              --webhooks "evidence/${phase}-webhooks.json" \
+              --namespace "$NS" --output "evidence/${phase}-analysis.json"
+          }
+          probe_a() {
+            local name="$1" label="$2"
+            kubectl -n "$NS" apply -f - >/dev/null <<EOF
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: $name
+            labels:
+              ordersafe.io/alpha: '$label'
+          data:
+            state: original
+          EOF
+            kubectl -n "$NS" get cm "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-a"] // "none"' "evidence/object-$name.json"
+          }
+          probe_b() {
+            local name="$1"
+            kubectl -n "$NS" apply -f - >/dev/null <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: $name
+            labels:
+              ordersafe.io/beta: 'yes'
+          type: Opaque
+          stringData:
+            key: value
+          EOF
+            kubectl -n "$NS" get secret "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' "evidence/object-$name.json"
+          }
+
+          phase=baseline_a
+          kubectl apply -f /tmp/order2-a.yaml
+          wait_hook order2-a-configmaps present
+          snapshot a-alone
+          a_alone=$(probe_a order2-a-alone yes)
+
+          phase=baseline_b
+          kubectl delete -f /tmp/order2-a.yaml --wait=true
+          wait_hook order2-a-configmaps absent
+          kubectl apply -f /tmp/order2-b.yaml
+          wait_hook order2-b-secrets present
+          snapshot b-alone
+          b_alone=$(probe_b order2-b-alone)
+
+          phase=pair
+          kubectl apply -f /tmp/order2-a.yaml
+          wait_hook order2-a-configmaps present
+          snapshot paired
+          a_pair=$(probe_a order2-a-pair yes)
+          b_pair=$(probe_b order2-b-pair)
+
+          phase=guard
+          kubectl patch mutatingpolicy order2-b-secrets --type=merge \
+            -p '{"spec":{"matchConditions":[{"name":"split-webhook","expression":"true"}]}}'
+          # Match condition forces a separate admission registration entry in Kyverno 1.18.
+          for _ in $(seq 1 30); do
+            hooks=$(kubectl get mutatingwebhookconfigurations -o json)
+            if echo "$hooks" | jq -e '[.items[]? | .webhooks[]? | (.clientConfig.service.path // "") | select(.=="/mpol/order2-a-configmaps" or .=="/mpol/order2-b-secrets")] | length == 2' >/dev/null; then
+              sleep 5; break
+            fi
+            sleep 5
+          done
+          snapshot guarded
+          a_guard=$(probe_a order2-a-guard yes)
+          b_guard=$(probe_b order2-b-guard)
+          a_negative=$(probe_a order2-a-negative no)
+
+          phase=old_new_selector
+          kubectl delete -f /tmp/order2-a.yaml -f /tmp/order2-b.yaml --wait=true
+          wait_hook order2-a-configmaps absent
+          wait_hook order2-b-secrets absent
+          # Create fixtures *before* installing UPDATE policy C. Otherwise the first
+          # label addition would already mutate the 'old-label' fixture and contaminate the control.
+          kubectl -n "$NS" create cm order2-c-from-alpha --from-literal=state=before >/dev/null
+          kubectl -n "$NS" label cm order2-c-from-alpha ordersafe.io/alpha=yes >/dev/null
+          kubectl -n "$NS" create cm order2-c-to-alpha --from-literal=state=before >/dev/null
+          kubectl -n "$NS" create cm order2-c-negative --from-literal=state=before >/dev/null
+          kubectl apply -f /tmp/order2-c.yaml
+          wait_hook order2-c-old-new present
+          snapshot old-new
+          # UPDATE: old matches, new does not. Object had no mutation before this update.
+          kubectl -n "$NS" label cm order2-c-from-alpha ordersafe.io/alpha- >/dev/null
+          kubectl -n "$NS" get cm order2-c-from-alpha -o json > evidence/object-c-old.json
+          c_old=$(jq -r '.metadata.annotations["ordersafe.io/mut-c"] // "none"' evidence/object-c-old.json)
+          # UPDATE: old does not match, new does.
+          kubectl -n "$NS" label cm order2-c-to-alpha ordersafe.io/alpha=yes >/dev/null
+          kubectl -n "$NS" get cm order2-c-to-alpha -o json > evidence/object-c-new.json
+          c_new=$(jq -r '.metadata.annotations["ordersafe.io/mut-c"] // "none"' evidence/object-c-new.json)
+          # UPDATE: neither old nor new matches.
+          kubectl -n "$NS" patch cm order2-c-negative --type=merge -p '{"data":{"state":"after"}}' >/dev/null
+          kubectl -n "$NS" get cm order2-c-negative -o json > evidence/object-c-negative.json
+          c_negative=$(jq -r '.metadata.annotations["ordersafe.io/mut-c"] // "none"' evidence/object-c-negative.json)
+
+          phase=decision
+          jq -n --arg a_alone "$a_alone" --arg b_alone "$b_alone" \
+            --arg a_pair "$a_pair" --arg b_pair "$b_pair" \
+            --arg a_guard "$a_guard" --arg b_guard "$b_guard" --arg a_negative "$a_negative" \
+            --arg c_old "$c_old" --arg c_new "$c_new" --arg c_negative "$c_negative" \
+            '{a_alone:$a_alone,b_alone:$b_alone,a_pair:$a_pair,b_pair:$b_pair,a_guard:$a_guard,b_guard:$b_guard,a_negative:$a_negative,c_old:$c_old,c_new:$c_new,c_negative:$c_negative}' \
+            > evidence/probe-results.json
+          runtime_verified=true
+          if [ "$a_alone" != yes ] || [ "$b_alone" != yes ]; then
+            status=INCONCLUSIVE_BASELINE
+            reason=POLICY_ALONE_NOT_EFFECTIVE
+          elif [ "$a_guard" != yes ] || [ "$b_guard" != yes ] || [ "$a_negative" != none ]; then
+            status=INCONCLUSIVE_GUARD_OR_NEGATIVE
+            reason=CONTROL_FAILED
+          elif [ "$c_old" != yes ] || [ "$c_new" != yes ] || [ "$c_negative" != none ]; then
+            status=INCONCLUSIVE_OLD_NEW
+            reason=SELECTOR_SEMANTICS_CONTROL_FAILED
+          elif [ "$a_pair" != yes ] || [ "$b_pair" != yes ]; then
+            status=DEFECT_PERSISTS_ON_1_19_2
+            reason=PAIR_LOST_MUTATION
+          else
+            status=NO_DEFECT_OBSERVED_ON_1_19_2
+            reason=PAIR_BOTH_MUTATED
+          fi
+          printf 'RESULT=%s; A=%s/%s/%s; B=%s/%s/%s; C=%s/%s/%s\n' "$status" "$a_alone" "$a_pair" "$a_guard" "$b_alone" "$b_pair" "$b_guard" "$c_old" "$c_new" "$c_negative"
+
+          # Cross-check model predictions against admission outcomes. This is not a novelty claim:
+          # two live policies are far too small for a comparative research evaluation.
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path('evidence')
+          raw=json.loads((p/'probe-results.json').read_text())
+          paired=json.loads((p/'paired-analysis.json').read_text())['results']
+          guarded=json.loads((p/'guarded-analysis.json').read_text())['results']
+          old_new=json.loads((p/'old-new-analysis.json').read_text())['results']
+          name_a='order2-a-configmaps'
+          name_b='order2-b-secrets'
+          name_c='order2-c-old-new'
+          rows=[]
+          for label,name,model,observed in [
+              ('paired-A',name_a,paired,raw['a_pair']),
+              ('paired-B',name_b,paired,raw['b_pair']),
+              ('guarded-A',name_a,guarded,raw['a_guard']),
+              ('guarded-B',name_b,guarded,raw['b_guard']),
+              ('old-new-C',name_c,old_new,raw['c_old'])]:
+              predicted=model.get(name,{}).get('status','UNKNOWN')
+              rows.append({'case':label,'model_prefilter':predicted,'mutation_observed':observed,
+                           'model_runtime_agree':(predicted=='UNREACHABLE_PREFILTER' and observed=='none')
+                                   or (predicted=='COVERED_IN_SUPPORTED_MODEL' and observed=='yes')})
+          res={'cases':rows,'agreement_count':sum(x['model_runtime_agree'] for x in rows),
+               'evaluated_cases':len(rows),'novelty_gate':'NOT_ESTABLISHED',
+               'research_limits':['small engineered live corpus','no independent dataset',
+                                  'no backend mutation equivalence proof','no validated efficiency advantage']}
+          (p/'consistency-check.json').write_text(json.dumps(res,indent=2)+'\n')
+          print('MODEL_RUNTIME_AGREEMENT:',res['agreement_count'],'/',res['evaluated_cases'])
+          PY
+      - name: Record versions and controller logs even on failure
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          kubectl get mutatingwebhookconfigurations -o yaml > evidence/final-webhooks.yaml 2>evidence/webhook-inspection.err || true
+          kubectl -n kyverno logs deploy/kyverno-admission-controller --tail=350 > evidence/kyverno-admission.log 2>evidence/controller-log.err || true
+          kubectl -n kyverno get pods -o wide > evidence/final-kyverno-pods.txt 2>evidence/pods.err || true
+          if [ ! -f evidence/runtime-status.json ]; then
+            printf '%s\n' '{"status":"BLOCKED_BEFORE_RUNTIME", "reason":"PRECONDITION_OR_INSTALL_FAILURE", "runtime_verified":false}' > evidence/runtime-status.json
+          fi
+          python --version > evidence/python-version.txt 2>&1 || true
+      - name: Upload one complete evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderSafe_Gate02_Combined_Results
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
+# ORDERSAFE_GATE02_END_MARKER
