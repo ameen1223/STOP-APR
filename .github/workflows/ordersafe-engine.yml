@@ -94,3 +94,188 @@ jobs:
           POLICY_B
 
           # Policy A: distinct resource rules and objectSelector, as in the reported issue.
+          cat > /tmp/ordersafe-policy-a.yaml <<'POLICY_A'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: ordersafe-a-rbac
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['rbac.authorization.k8s.io']
+                  apiVersions: ['v1']
+                  operations: ['CREATE', 'UPDATE']
+                  resources: ['roles', 'rolebindings']
+              objectSelector:
+                matchLabels:
+                  app.kubernetes.io/component: 'runner-scale-set-listener'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{
+                      metadata: Object.metadata{
+                        annotations: {"ordersafe.io/mut-a": "yes"}
+                      }
+                    }
+          POLICY_A
+
+          cp /tmp/ordersafe-policy-a.yaml evidence/policy-a.yaml
+          cp /tmp/ordersafe-policy-b.yaml evidence/policy-b.yaml
+
+          hook_has() {
+            kubectl get mutatingwebhookconfigurations -o json | jq -e --arg p "$1" \
+              '[.items[]? | .webhooks[]? | (.clientConfig.service.path // "") | select(contains($p))] | length > 0' \
+              >/dev/null
+          }
+          wait_hook_present() {
+            for i in $(seq 1 36); do
+              if hook_has "$1"; then sleep 5; return 0; fi
+              sleep 5
+            done
+            echo "Missing expected webhook path for policy: $1" >&2
+            return 1
+          }
+          wait_hook_absent() {
+            for i in $(seq 1 36); do
+              if ! hook_has "$1"; then sleep 5; return 0; fi
+              sleep 5
+            done
+            echo "Webhook path for removed policy still present: $1" >&2
+            return 1
+          }
+          snapshot() {
+            kubectl get mutatingwebhookconfigurations -o json > "evidence/webhooks-$1.json"
+            kubectl get mutatingpolicies.policies.kyverno.io -o json > "evidence/policies-$1.json"
+          }
+          make_cm() {
+            local name="$1" watch="$2"
+            cat <<EOF | kubectl -n "$NS" apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: $name
+            labels:
+              ordersafe.io/watch: '$watch'
+          data:
+            phase: before
+          EOF
+          }
+          make_role() {
+            local name="$1"
+            cat <<EOF | kubectl -n "$NS" apply -f -
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: $name
+            labels:
+              app.kubernetes.io/component: runner-scale-set-listener
+          rules: []
+          EOF
+          }
+          probe_b() {
+            local name="$1"
+            make_cm "$name" true
+            kubectl -n "$NS" patch configmap "$name" --type=merge -p '{"data":{"phase":"after"}}' \
+              > "evidence/patch-$name.txt"
+            kubectl -n "$NS" get configmap "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' "evidence/object-$name.json"
+          }
+          probe_a() {
+            local name="$1"
+            make_role "$name"
+            kubectl -n "$NS" get role "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-a"] // "none"' "evidence/object-$name.json"
+          }
+
+          phase=baseline_b
+          kubectl apply -f /tmp/ordersafe-policy-b.yaml
+          wait_hook_present ordersafe-b-watch-configmaps
+          snapshot b-alone
+          b_alone=$(probe_b ordersafe-b-alone)
+          echo "BASELINE_B=$b_alone"
+
+          phase=baseline_a
+          kubectl delete -f /tmp/ordersafe-policy-b.yaml --wait=true
+          wait_hook_absent ordersafe-b-watch-configmaps
+          kubectl apply -f /tmp/ordersafe-policy-a.yaml
+          wait_hook_present ordersafe-a-rbac
+          snapshot a-alone
+          a_alone=$(probe_a ordersafe-a-alone)
+          echo "BASELINE_A=$a_alone"
+
+          phase=paired_policies
+          kubectl apply -f /tmp/ordersafe-policy-b.yaml
+          wait_hook_present ordersafe-b-watch-configmaps
+          snapshot paired
+          b_pair=$(probe_b ordersafe-b-pair)
+          a_pair=$(probe_a ordersafe-a-pair)
+          echo "PAIR_B=$b_pair; PAIR_A=$a_pair"
+
+          phase=workaround_control
+          kubectl patch mutatingpolicy ordersafe-b-watch-configmaps --type=merge \
+            -p '{"spec":{"matchConditions":[{"name":"force-separate-hook","expression":"true"}]}}'
+          # Allow the controller and Kubernetes API server time to publish updated webhook match conditions.
+          sleep 20
+          snapshot with-matchcondition
+          b_guard=$(probe_b ordersafe-b-guard)
+          a_guard=$(probe_a ordersafe-a-guard)
+          echo "GUARD_B=$b_guard; GUARD_A=$a_guard"
+
+          phase=negative_selector_control
+          make_cm ordersafe-b-negative false
+          kubectl -n "$NS" patch configmap ordersafe-b-negative --type=merge \
+            -p '{"data":{"phase":"after"}}' > evidence/patch-negative.txt
+          kubectl -n "$NS" get configmap ordersafe-b-negative -o json > evidence/object-negative.json
+          negative=$(jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' evidence/object-negative.json)
+          echo "NEGATIVE_B=$negative"
+
+          phase=decision
+          printf 'stage\tA_mutated\tB_mutated\nB_only\tNA\t%s\nA_only\t%s\tNA\nA_plus_B\t%s\t%s\nA_plus_B_guard\t%s\t%s\nnegative_label\tNA\t%s\n' \
+            "$b_alone" "$a_alone" "$a_pair" "$b_pair" "$a_guard" "$b_guard" "$negative" \
+            > evidence/stage-results.tsv
+          jq -n --arg b_alone "$b_alone" --arg a_alone "$a_alone" \
+            --arg b_pair "$b_pair" --arg a_pair "$a_pair" \
+            --arg b_guard "$b_guard" --arg a_guard "$a_guard" --arg negative "$negative" \
+            '{b_alone:$b_alone,a_alone:$a_alone,b_pair:$b_pair,a_pair:$a_pair,b_guard:$b_guard,a_guard:$a_guard,negative:$negative}' \
+            > evidence/probe-results.json
+          runtime_verified=true
+          if [ "$a_alone" != yes ] || [ "$b_alone" != yes ]; then
+            status=INCONCLUSIVE_BASELINE
+            reason=ONE_OR_BOTH_POLICIES_FAILED_ALONE
+          elif [ "$negative" != none ]; then
+            status=INCONCLUSIVE_SELECTOR
+            reason=NEGATIVE_CONTROL_WAS_MUTATED
+          elif [ "$a_pair" = yes ] && [ "$b_pair" = yes ]; then
+            status=NO_COMPOSITION_DEFECT_OBSERVED
+            reason=BOTH_POLICIES_MUTATED_IN_PAIR
+          elif [ "$a_guard" = yes ] && [ "$b_guard" = yes ]; then
+            status=COMPOSITION_DEFECT_REPRODUCED
+            reason=PAIR_LOST_MUTATION_AND_MATCHCONDITION_RESTORED_IT
+          else
+            status=INCONCLUSIVE_COMPOSITION_FAILURE
+            reason=PAIR_FAILED_BUT_WORKAROUND_DID_NOT_RECOVER_BOTH
+          fi
+          echo "Scientific classification: $status"
+      - name: Capture diagnostics even if a test fails
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          { kubectl get mutatingwebhookconfigurations -o yaml || true; } > evidence/final-webhooks.yaml 2>&1
+          { kubectl get mutatingpolicies.policies.kyverno.io -o yaml || true; } > evidence/final-policies.yaml 2>&1
+          { kubectl get pods -n kyverno -o wide || true; } > evidence/final-pods.txt 2>&1
+          { kubectl logs -n kyverno deployment/kyverno-admission-controller --all-containers --tail=300 || true; } > evidence/kyverno-admission.log 2>&1
+          { kubectl get events -n kyverno --sort-by='.lastTimestamp' || true; } > evidence/kyverno-events.txt 2>&1
+          if [ ! -s evidence/summary.json ]; then
+            printf '%s\n' '{"status":"BLOCKED_BEFORE_PROBE","reason":"WORKFLOW_SETUP_FAILURE","runtime_verified":false}' > evidence/summary.json
+          fi
+      - name: Upload complete evidence (including blocked runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderSafe_EngineGate_Results
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
