@@ -1,0 +1,1025 @@
+# OrderSafe Gate03. One workflow, two EXACTLY MATCHED Kyverno versions.
+# Same policy YAML, same Kubernetes node image, same probes, isolated runners.
+# Does not modify any existing user cluster. Analysis is prefilter-only.
+name: OrderSafe Gate03 Causal Delta and Matched Engine
+'on':
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  engine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        kyverno_chart: ['3.8.1', '3.9.2']
+    steps:
+      - name: Create evidence folder
+        shell: bash
+        run: mkdir -p evidence research
+      - name: Create exact local symbolic analyzers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p research evidence
+          cat > research/selector_delta.py <<'PY_SELECTOR_DELTA_PY'
+          #!/usr/bin/env python3
+          """Selector delta pilot: exact bounded-grammar, unbounded label dimensionality.
+          
+          Scope: namespaced exact resource/API/operations (CREATE or UPDATE); Kubernetes
+          LabelSelectors on namespace and old/new objects; inspected Kyverno /mpol/ routes.
+          Unlike a Kubernetes runtime verifier, this detects potential prefilter bypasses;
+          actual changes require an engine. Unknown CEL and non-exact rules fail closed.
+          
+          Representation: symbolic finite domains partitioned by literal values, absent and
+          an OTHER equivalence class, with recursive disjoint hyperrectangle subtraction.
+          """
+          from __future__ import annotations
+          import argparse
+          import json
+          import random
+          import time
+          import zipfile
+          from collections import Counter
+          from dataclasses import dataclass
+          from itertools import product
+          from pathlib import Path
+          
+          MISSING='<ABSENT>'
+          OTHER='<OTHER>'
+          
+          class Unsupported(Exception): pass
+          
+          # Explicitly namespaced resource types only; requests for unknown/cluster-scoped
+          # resources are not covered by this model without discovery-schema evidence.
+          NAMESPACED_RESOURCES = {
+              'configmaps','secrets','pods','services','serviceaccounts','endpoints',
+              'persistentvolumeclaims','resourcequotas','limitranges','events',
+              'roles','rolebindings','deployments','replicasets','statefulsets',
+              'daemonsets','jobs','cronjobs','ingresses','networkpolicies',
+              'horizontalpodautoscalers'
+          }
+          
+          def validate_match(m):
+              if not isinstance(m,dict): raise Unsupported('malformed matchConstraints')
+              if set(m)-{'resourceRules','objectSelector','namespaceSelector','matchPolicy'}:
+                  raise Unsupported('unmodeled matchConstraints field')
+              if m.get('matchPolicy','Equivalent') not in ('Exact','Equivalent'):
+                  raise Unsupported('unsupported matchPolicy')
+          
+          def api_maybe_match(hook,api):
+              """Overapproximate Equivalent-version routing, avoiding false gap witnesses."""
+              api_set=tuples(hook['rules'])
+              if api in api_set:return True
+              if hook.get('matchPolicy','Equivalent') == 'Equivalent':
+                  return any(x[2:]==api[2:] for x in api_set)
+              return False
+          
+          
+          def kvs(sel):
+              if sel is None: return {}
+              if not isinstance(sel,dict) or set(sel)-{'matchLabels','matchExpressions'}:
+                  raise Unsupported('unsupported selector structure')
+              out={}
+              for k,v in (sel.get('matchLabels') or {}).items():
+                  if not isinstance(k,str) or not isinstance(v,str): raise Unsupported('invalid matchLabels')
+                  out.setdefault(k,set()).add(v)
+              for ex in sel.get('matchExpressions') or []:
+                  k,op,vals=ex.get('key'),ex.get('operator'),ex.get('values',[])
+                  if not isinstance(k,str) or op not in {'In','NotIn','Exists','DoesNotExist'} or not isinstance(vals,list) or any(not isinstance(x,str) for x in vals):
+                      raise Unsupported('unsupported expression')
+                  if op in ('Exists','DoesNotExist') and vals: raise Unsupported('unexpected values for operator')
+                  if op in ('In','NotIn') and not vals: raise Unsupported('empty In/NotIn')
+                  out.setdefault(k,set()).update(vals)
+              return out
+          
+          
+          def truth(sel, labels):
+              if sel is None: return True
+              kvs(sel)
+              for k,v in (sel.get('matchLabels') or {}).items():
+                  if labels.get(k,MISSING)!=v: return False
+              for e in (sel.get('matchExpressions') or []):
+                  k,op,vals=e['key'],e['operator'],e.get('values',[])
+                  x=labels.get(k,MISSING)
+                  if op=='In' and x not in vals: return False
+                  if op=='NotIn' and x in vals: return False
+                  if op=='Exists' and x==MISSING: return False
+                  if op=='DoesNotExist' and x!=MISSING: return False
+              return True
+          
+          
+          def has_unsupported_conditions(obj):
+              for x in obj.get('matchConditions') or []:
+                  if x.get('expression','').strip()!='true':
+                      raise Unsupported('nontrivial CEL not modeled')
+          
+          
+          def tuples(rules):
+              if not rules: raise Unsupported('empty resourceRules')
+              res=set()
+              for r in rules:
+                  if r.get('resourceNames') or r.get('excludeResourceRules'): raise Unsupported('resourceNames/exclusions not modeled')
+                  if r.get('scope','*') not in ('*','Namespaced'): raise Unsupported('cluster resource scope')
+                  for k in ('apiGroups','apiVersions','resources','operations'):
+                      if not isinstance(r.get(k),list) or not r[k]: raise Unsupported('empty '+k)
+                  for group,version,resource,operation in product(r['apiGroups'],r['apiVersions'],r['resources'],r['operations']):
+                      if resource not in NAMESPACED_RESOURCES: raise Unsupported('unknown-or-cluster-scoped resource: '+resource)
+                      if operation not in ('CREATE','UPDATE') or not all(isinstance(s,str) and s and '*' not in s and '/' not in s for s in (version,resource,operation)) or '*' in group:
+                          raise Unsupported('wildcard/subresource/unsupported operation')
+                      res.add((group,version,resource,operation))
+              return sorted(res)
+          
+          
+          @dataclass
+          class CubeStats:
+              intersections: int=0
+              fragments: int=0
+              peak_cubes: int=0
+              state_space: int=0
+          
+          
+          class Symbolic:
+              def __init__(self, selectors, operation, namespace, max_boxes=100000):
+                  self.operation=operation
+                  self.namespace=namespace
+                  self.max_boxes=max_boxes
+                  keys={}
+                  for origin,s in selectors:
+                      for k,v in kvs(s).items():
+                          keys.setdefault((origin,k),set()).update(v)
+                  keys[('ns','kubernetes.io/metadata.name')] = keys.get(('ns','kubernetes.io/metadata.name'),set())|{namespace}
+                  self.dims=sorted(keys)
+                  self.dom={}
+                  for dim,v in keys.items():
+                      vs=[MISSING]+sorted(v)
+                      other=OTHER
+                      while other in vs: other+='-x'
+                      vs.append(other)
+                      if dim==('ns','kubernetes.io/metadata.name'): vs=[namespace]
+                      self.dom[dim]=frozenset(vs)
+                  self.stats=CubeStats()
+                  n=1
+                  for d in self.dims: n*=len(self.dom[d])
+                  self.stats.state_space=n
+          
+              def restrict(self,selector,origin):
+                  # Use all-dimensional cube so disjoint difference is straightforward.
+                  c={d:self.dom[d] for d in self.dims}
+                  if selector is None: return c
+                  for k,v in (selector.get('matchLabels') or {}).items():
+                      d=(origin,k)
+                      if d not in c: raise Unsupported('key domain missing')
+                      c[d]=c[d].intersection([v])
+                  for e in (selector.get('matchExpressions') or []):
+                      d=(origin,e['key']); op=e['operator']; values=e.get('values') or []
+                      if op=='In': c[d]=c[d].intersection(values)
+                      elif op=='NotIn': c[d]=c[d]-set(values)
+                      elif op=='Exists': c[d]=c[d]-{MISSING}
+                      elif op=='DoesNotExist': c[d]=c[d].intersection([MISSING])
+                  return {k:frozenset(v) for k,v in c.items()}
+          
+              def intersect(self,a,b):
+                  self.stats.intersections+=1
+                  c={d:a[d]&b[d] for d in self.dims}
+                  return c if all(c.values()) else None
+          
+              def subtract(self,a,b):
+                  intersection=self.intersect(a,b)
+                  if intersection is None: return [a]
+                  pieces=[]
+                  prefix={}
+                  for d in self.dims:
+                      extra=a[d]-intersection[d]
+                      if extra:
+                          piece=dict(a)
+                          piece.update(prefix)
+                          piece[d]=extra
+                          pieces.append(piece)
+                      prefix[d]=intersection[d]
+                  self.stats.fragments+=len(pieces)
+                  return pieces
+          
+              def dnf(self, ns_selector, obj_selector):
+                  n=self.restrict(ns_selector,'ns')
+                  news=self.restrict(obj_selector,'new')
+                  if self.operation=='CREATE':
+                      cube=self.intersect(n,news)
+                      return [cube] if cube else []
+                  olds=self.restrict(obj_selector,'old')
+                  return [cube for cube in (self.intersect(n,news),self.intersect(n,olds)) if cube]
+          
+              def diff(self,baselines,coverage):
+                  remaining=list(baselines)
+                  for cv in coverage:
+                      nxt=[]
+                      for p in remaining: nxt.extend(self.subtract(p,cv))
+                      remaining=nxt
+                      self.stats.peak_cubes=max(self.stats.peak_cubes,len(remaining))
+                      if len(remaining)>self.max_boxes: raise Unsupported('symbolic cube expansion limit exceeded')
+                      if not remaining: return []
+                  return remaining
+          
+              def pick(self,cubes):
+                  def value_key(v): return (v!=MISSING, v==OTHER, str(v))
+                  def choose(c): return {d:min(c[d],key=value_key) for d in self.dims}
+                  def cost(values):
+                      return (sum(v!=MISSING for d,v in values.items() if d[0]!='ns'),
+                              sum(v==OTHER for v in values.values()),
+                              tuple(str(values[d]) for d in self.dims))
+                  best=min((choose(c) for c in cubes),key=cost)
+                  def labels(pos):
+                      return {k:v for (p,k),v in best.items() if p==pos and v!=MISSING}
+                  return {'namespace_labels':labels('ns'), 'new_labels':labels('new'),
+                          'old_labels':labels('old') if self.operation=='UPDATE' else None,
+                          'minimal_present_labels':cost(best)[0]}
+          
+          
+          def attached(policy,hooks):
+              name=policy['metadata']['name']
+              result=[]
+              for w in hooks:
+                  path=w.get('clientConfig',{}).get('service',{}).get('path','')
+                  bits=path.split('/')
+                  if len(bits)>=3 and bits[1]=='mpol' and name in bits[2:]: result.append(w)
+              return result
+          
+          
+          def check(policy, hooks, namespace='ordersafe-gate', max_boxes=100000):
+              spec=policy.get('spec',{})
+              match=spec.get('matchConstraints') or {}
+              has_unsupported_conditions(spec)
+              validate_match(match)
+              apis=tuples(match.get('resourceRules'))
+              candidates=attached(policy,hooks)
+              for w in candidates:
+                  has_unsupported_conditions(w)
+                  tuples(w.get('rules'))
+              objsel=match.get('objectSelector')
+              nssel=match.get('namespaceSelector')
+              allsels=[('ns',nssel),('new',objsel)]
+              if any(op[-1]=='UPDATE' for op in apis): allsels.append(('old',objsel))
+              for w in candidates:
+                  allsels.extend([('ns',w.get('namespaceSelector')),('new',w.get('objectSelector'))])
+                  if any(op[-1]=='UPDATE' for op in apis): allsels.append(('old',w.get('objectSelector')))
+              t0=time.perf_counter()
+              for api in apis:
+                  sym=Symbolic(allsels,api[-1],namespace,max_boxes=max_boxes)
+                  intent=sym.dnf(nssel,objsel)
+                  cover=[]
+                  for w in candidates:
+                      if api_maybe_match(w,api): cover.extend(sym.dnf(w.get('namespaceSelector'),w.get('objectSelector')))
+                  residual=sym.diff(intent,cover)
+                  if residual:
+                      witness=sym.pick(residual)
+                      # The returned witness is exact within modeled request-matching language.
+                      assert (truth(nssel,witness['namespace_labels']) and
+                              (truth(objsel,witness['new_labels']) or (witness['old_labels'] is not None and truth(objsel,witness['old_labels']))))
+                      for w in candidates:
+                          if not api_maybe_match(w,api): continue
+                          assert not (truth(w.get('namespaceSelector'),witness['namespace_labels']) and
+                                 (truth(w.get('objectSelector'),witness['new_labels']) or
+                                   (witness['old_labels'] is not None and truth(w.get('objectSelector'),witness['old_labels']))))
+                      return {'status':'UNREACHABLE_PREFILTER','api':api,'witness':witness,'runtime_ms':round((time.perf_counter()-t0)*1000,5),
+                              'stats':vars(sym.stats),'connected_hooks':len(candidates),'scope':'selector-prefilter,not-mutation'}
+              return {'status':'COVERED_IN_SUPPORTED_MODEL', 'runtime_ms':round((time.perf_counter()-t0)*1000,5),
+                      'stats':vars(sym.stats),'connected_hooks':len(candidates),'scope':'selector-prefilter,not-mutation'}
+          
+          
+          def p(name,resource,op,selector=None,nssel=None):
+              return {'metadata':{'name':name},'spec':{'matchConstraints':{'resourceRules':[{'apiGroups':[''],'apiVersions':['v1'],'operations':[op],'resources':[resource]}], 'objectSelector':selector,'namespaceSelector':nssel}}}
+          
+          
+          def h(names,resource,op,selector=None,nssel=None):
+              return {'clientConfig':{'service':{'path':'/mpol/'+'/'.join(names)}},'rules':[{'apiGroups':[''],'apiVersions':['v1'],'operations':[op],'resources':[resource]}], 'objectSelector':selector,'namespaceSelector':nssel}
+          
+          
+          def small_brute(policy, hooks):
+              spec=policy['spec']; match=spec['matchConstraints']; api=tuples(match['resourceRules'])[0]; hs=attached(policy,hooks)
+              sels=[match.get('objectSelector')]+[w.get('objectSelector') for w in hs]
+              nsels=[match.get('namespaceSelector')]+[w.get('namespaceSelector') for w in hs]
+              def vars_for(sels):
+                  vals={}
+                  for s in sels:
+                      for k,v in kvs(s).items(): vals.setdefault(k,set()).update(v)
+                  return {k:[MISSING]+sorted(v)+[OTHER] for k,v in vals.items()}
+              od=vars_for(sels); nd=vars_for(nsels)
+              nd['kubernetes.io/metadata.name']=['ordersafe-gate']
+              def assignments(dom):
+                  keys=sorted(dom)
+                  for row in product(*(dom[k] for k in keys)):
+                      yield {k:v for k,v in zip(keys,row) if v!=MISSING}
+              for ns in assignments(nd):
+                  for new in assignments(od):
+                      for old in ([None] if api[-1]=='CREATE' else list(assignments(od))):
+                          if not truth(match.get('namespaceSelector'),ns): continue
+                          if not (truth(match.get('objectSelector'),new) or (old is not None and truth(match.get('objectSelector'),old))):continue
+                          if any(api in tuples(w['rules']) and truth(w.get('namespaceSelector'),ns) and (truth(w.get('objectSelector'),new) or (old is not None and truth(w.get('objectSelector'),old))) for w in hs):continue
+                          return True
+              return False
+          
+          
+          def selftest():
+              t0=time.perf_counter(); n=0; rng=random.Random(20261027)
+              ops=['In','NotIn','Exists','DoesNotExist']
+              def sel_random():
+                  entries=[]
+                  for _ in range(rng.randint(0,3)):
+                      key=rng.choice(['team','tier','owner']); op=rng.choice(ops)
+                      if op in ('Exists','DoesNotExist'): v=[]
+                      else: v=[rng.choice(['a','b','c'])]
+                      entries.append({'key':key,'operator':op,'values':v})
+                  return {'matchExpressions':entries}
+              for op in ('CREATE','UPDATE'):
+                  for i in range(400):
+                      pol=p('trial','configmaps',op,sel_random(),sel_random())
+                      hooks=[h(['trial'],'configmaps',op,sel_random(),sel_random()) for _ in range(rng.randint(0,3))]
+                      got=check(pol,hooks)['status']=='UNREACHABLE_PREFILTER'
+                      expected=small_brute(pol,hooks)
+                      if got!=expected: raise AssertionError(('unsound',op,i,got,expected,pol,hooks))
+                      n+=1
+              huge={f'label{i}':f'value{i}' for i in range(18)}
+              big=p('big','configmaps','UPDATE',{'matchLabels':huge})
+              hooks=[h(['big'],'configmaps','UPDATE',{'matchLabels':{'label0':'other'}})]
+              result=check(big,hooks)
+              assert result['status']=='UNREACHABLE_PREFILTER'
+              assert result['stats']['state_space'] > 10**12
+              n+=1
+              b=p('b','configmaps','CREATE',{'matchLabels':{'t':'a'}})
+              assert check(b,[h(['b'],'configmaps','CREATE',None)])['status']=='COVERED_IN_SUPPORTED_MODEL'
+              assert check(b,[h(['b'],'secrets','CREATE',None)])['status']=='UNREACHABLE_PREFILTER'
+              n+=2
+              return {'tests':n,'elapsed_sec':round(time.perf_counter()-t0,4),'large_state_case':result}
+          
+          
+          def audit_evidence(zip_path):
+              with zipfile.ZipFile(zip_path) as z:
+                  names=z.namelist()
+                  if 'policies-paired.json' in names:
+                      cases=[('pair','policies-paired.json','webhooks-paired.json'),('separated','policies-with-matchcondition.json','webhooks-with-matchcondition.json')]
+                  else:
+                      cases=[('pair','paired-policies.json','paired-webhooks.json'),('guarded','guarded-policies.json','guarded-webhooks.json')]
+                  results={}
+                  for label,pf,wf in cases:
+                      policies=json.loads(z.read(pf))['items']
+                      hooks=[w for cfg in json.loads(z.read(wf))['items'] for w in cfg.get('webhooks',[])]
+                      results[label]={p['metadata']['name']:check(p,hooks) for p in policies if p.get('kind')=='MutatingPolicy'}
+                  return results
+          
+          
+          def main():
+              ap=argparse.ArgumentParser();ap.add_argument('--gate01');ap.add_argument('--gate02');ap.add_argument('--out',default='ordersafe_symbolic_results.json')
+              a=ap.parse_args()
+              result={'algorithm':'exact selector cubes with disjoint subtraction','limitations':'namespaced exact resources; no nontrivial CEL; no mutation semantics'}
+              result['local_selftest']=selftest()
+              if a.gate01: result['gate01']=audit_evidence(a.gate01)
+              if a.gate02: result['gate02']=audit_evidence(a.gate02)
+              Path(a.out).write_text(json.dumps(result,indent=2,sort_keys=True))
+              print('WROTE',a.out,'SELFTESTS',result['local_selftest']['tests'],'TIME',result['local_selftest']['elapsed_sec'])
+              for phase in ('gate01','gate02'):
+                  for name,cases in result.get(phase,{}).items():
+                      print(phase,name,{p:x['status'] for p,x in cases.items()})
+          
+          if __name__=='__main__': main()
+          PY_SELECTOR_DELTA_PY
+          cat > research/bdd_exact.py <<'PY_BDD_EXACT_PY'
+          #!/usr/bin/env python3
+          """Reduced ordered multi-valued decision diagram (ROMDD) for selector coverage.
+          
+          Uses exact finite predicate abstraction for Kubernetes selectors; detects prefilter
+          unreachability. Does not model webhook backend, nontrivial CEL, or mutations.
+          """
+          from __future__ import annotations
+          import sys,time,json,argparse
+          from pathlib import Path
+          import selector_delta as s
+          
+          class MDD:
+              def __init__(self,sym,max_nodes=300000):
+                  self.sym=sym
+                  self.dims=sym.dims
+                  self.dom=[tuple(sorted(sym.dom[d],key=str)) for d in self.dims]
+                  self.nodes=[None,None]
+                  self.unique={}
+                  self.apply_cache={}
+                  self.neg_cache={0:1,1:0}
+                  self.max_nodes=max_nodes
+                  self.apply_calls=0
+              def mk(self,dim, children):
+                  children=tuple(children)
+                  if all(c==children[0] for c in children): return children[0]
+                  k=(dim,children)
+                  if k not in self.unique:
+                      if len(self.nodes)>=self.max_nodes:raise s.Unsupported('MDD node cap reached')
+                      idx=len(self.nodes);self.nodes.append(k);self.unique[k]=idx
+                  return self.unique[k]
+              def lev(self,n): return self.nodes[n][0] if n>1 else len(self.dims)
+              def child(self,n,i,option):
+                  if self.lev(n)==i:
+                      return self.nodes[n][1][option]
+                  return n
+              def negate(self,n):
+                  if n in self.neg_cache:return self.neg_cache[n]
+                  i,children=self.nodes[n];v=self.mk(i,[self.negate(ch) for ch in children]);self.neg_cache[n]=v;return v
+              def apply(self,op,a,b):
+                  self.apply_calls+=1
+                  if op=='and':
+                      if a==0 or b==0:return 0
+                      if a==1:return b
+                      if b==1:return a
+                      if a==b:return a
+                  elif op=='or':
+                      if a==1 or b==1:return 1
+                      if a==0:return b
+                      if b==0:return a
+                      if a==b:return a
+                  if b<a:a,b=b,a
+                  k=(op,a,b)
+                  if k in self.apply_cache:return self.apply_cache[k]
+                  i=min(self.lev(a),self.lev(b))
+                  out=self.mk(i,[self.apply(op,self.child(a,i,j),self.child(b,i,j)) for j in range(len(self.dom[i]))])
+                  self.apply_cache[k]=out
+                  return out
+              def union(self,root,other):return self.apply('or',root,other)
+              def intersection(self,a,b):return self.apply('and',a,b)
+              def cube(self,allowed):
+                  root=1
+                  for idx in reversed(range(len(self.dims))):
+                      dim=self.dims[idx]
+                      vs=allowed[dim]
+                      if vs==self.sym.dom[dim]:continue
+                      root=self.mk(idx,[root if v in vs else 0 for v in self.dom[idx]])
+                  return root
+              def disjunction(self,cubes):
+                  out=0
+                  for c in cubes:
+                      out=self.union(out,self.cube(c))
+                  return out
+              def minimal(self,root,operation):
+                  if root==0:return None
+                  memo={}
+                  def cost(idx,val):
+                      d=self.dims[idx]
+                      return ((val!=s.MISSING) if d[0]!='ns' else 0, val!=s.MISSING, val==s.OTHER, str(val))
+                  def solve(root):
+                      if root==1:return (0,())
+                      if root==0:return (float('inf'),())
+                      if root in memo:return memo[root]
+                      i,children=self.nodes[root]
+                      choices=[]
+                      for j,ch in enumerate(children):
+                          sub,trail=solve(ch)
+                          if sub==float('inf'):continue
+                          choices.append((sub+cost(i,self.dom[i][j])[0],(i,j)+trail))
+                      # missing variable gaps are cost-zero by MISSING (namespace: fixed only)
+                      out=min(choices,key=lambda x:(x[0],x[1]))
+                      memo[root]=out;return out
+                  count,path=solve(root)
+                  selected={self.dims[i]:self.dom[i][j] for i,j in zip(path[::2],path[1::2])}
+                  out={}
+                  for i,d in enumerate(self.dims):
+                      if d not in selected:
+                          selected[d]=s.MISSING if s.MISSING in self.dom[i] else self.dom[i][0]
+                  for kind in ['ns','new','old']:
+                      out[kind]={key:val for (k,key),val in selected.items() if k==kind and val!=s.MISSING}
+                  return {'namespace_labels':out['ns'],'new_labels':out['new'],'old_labels':out['old'] if operation=='UPDATE' else None,'minimal_present_labels':count}
+              def stats(self):return {'created_nodes':len(self.nodes)-2,'apply_cache_entries':len(self.apply_cache),'apply_calls':self.apply_calls,'symbolic_state_space':self.sym.stats.state_space}
+          
+          
+          def check(policy,hooks,namespace='ordersafe-gate',max_nodes=300000):
+              spec=policy.get('spec',{});matcher=spec.get('matchConstraints') or {}
+              s.has_unsupported_conditions(spec)
+              s.validate_match(matcher)
+              apis=s.tuples(matcher.get('resourceRules'))
+              candidates=s.attached(policy,hooks)
+              for w in candidates:s.has_unsupported_conditions(w);s.tuples(w.get('rules'))
+              sels=[('ns',matcher.get('namespaceSelector')),('new',matcher.get('objectSelector'))]
+              for w in candidates: sels.extend([('ns',w.get('namespaceSelector')),('new',w.get('objectSelector'))])
+              if any(api[-1]=='UPDATE' for api in apis):
+                  sels.extend([('old',matcher.get('objectSelector'))]+[('old',w.get('objectSelector')) for w in candidates])
+              t0=time.perf_counter()
+              maxnodes=0
+              for api in apis:
+                  sym=s.Symbolic(sels,api[-1],namespace)
+                  dd=MDD(sym,max_nodes=max_nodes)
+                  intent=dd.disjunction(sym.dnf(matcher.get('namespaceSelector'),matcher.get('objectSelector')))
+                  matched=[]
+                  for w in candidates:
+                      if s.api_maybe_match(w,api): matched.extend(sym.dnf(w.get('namespaceSelector'),w.get('objectSelector')))
+                  cover=dd.disjunction(matched)
+                  gap=dd.intersection(intent,dd.negate(cover))
+                  stats=dd.stats();maxnodes=max(maxnodes,stats['created_nodes'])
+                  if gap!=0:
+                      witness=dd.minimal(gap,api[-1]);ns=witness['namespace_labels'];new=witness['new_labels'];old=witness['old_labels']
+                      assert s.truth(matcher.get('namespaceSelector'),ns) and (s.truth(matcher.get('objectSelector'),new) or (old is not None and s.truth(matcher.get('objectSelector'),old)))
+                      for w in candidates:
+                          if not s.api_maybe_match(w,api):continue
+                          assert not (s.truth(w.get('namespaceSelector'),ns) and (s.truth(w.get('objectSelector'),new) or (old is not None and s.truth(w.get('objectSelector'),old))))
+                      return {'status':'UNREACHABLE_PREFILTER','api':api,'witness':witness,'runtime_ms':round((time.perf_counter()-t0)*1000,4),'stats':stats}
+              return {'status':'COVERED_IN_SUPPORTED_MODEL','runtime_ms':round((time.perf_counter()-t0)*1000,4),'stats':stats}
+          
+          
+          def delta(policy,before,after,namespace='ordersafe-gate'):
+              spec=policy.get('spec',{});match=spec.get('matchConstraints') or {}
+              s.has_unsupported_conditions(spec)
+              s.validate_match(match)
+              apis=s.tuples(match['resourceRules']);bef=s.attached(policy,before);aft=s.attached(policy,after)
+              for w in bef+aft:s.has_unsupported_conditions(w);s.tuples(w['rules'])
+              sels=[('ns',match.get('namespaceSelector')),('new',match.get('objectSelector'))]
+              for w in bef+aft: sels.extend([('ns',w.get('namespaceSelector')),('new',w.get('objectSelector'))])
+              if any(api[-1]=='UPDATE' for api in apis):sels.extend([('old',match.get('objectSelector'))]+[('old',w.get('objectSelector')) for w in bef+aft])
+              for api in apis:
+                  sym=s.Symbolic(sels,api[-1],namespace);d=MDD(sym)
+                  intent=d.disjunction(sym.dnf(match.get('namespaceSelector'),match.get('objectSelector')))
+                  prev=d.disjunction([cube for w in bef if s.api_maybe_match(w,api) for cube in sym.dnf(w.get('namespaceSelector'),w.get('objectSelector'))])
+                  next_=d.disjunction([cube for w in aft if s.api_maybe_match(w,api) for cube in sym.dnf(w.get('namespaceSelector'),w.get('objectSelector'))])
+                  gap=d.intersection(d.intersection(intent,prev),d.negate(next_))
+                  if gap!=0:
+                      w=d.minimal(gap,api[-1]);return {'status':'REGRESSION_WITNESS','api':api,'witness':w,'stats':d.stats()}
+              return {'status':'NO_REGRESSION_IN_SUPPORTED_MODEL','stats':d.stats()}
+          
+          
+          def main():
+              import causal_delta as cd
+              import random
+              rng=random.Random(20261027)
+              n=0
+              for op in ['CREATE','UPDATE']:
+                  for _ in range(500):
+                      selectors=[]
+                      def sel():
+                          arr=[]
+                          for _ in range(rng.randint(0,3)):
+                              kind=rng.choice(['In','NotIn','Exists','DoesNotExist'])
+                              arr.append({'key':rng.choice(['x','y','z']),'operator':kind,'values':[rng.choice(['v','w'])] if kind in ('In','NotIn') else []})
+                          return {'matchExpressions':arr}
+                      p=s.p('A','configmaps',op,sel(),sel())
+                      hooks=[s.h(['A'],'configmaps',op,sel(),sel()) for _ in range(rng.randint(0,4))]
+                      src=check(p,hooks)['status']
+                      ref=s.small_brute(p,hooks)
+                      if (src=='UNREACHABLE_PREFILTER')!=ref:raise AssertionError(('mismatch',op,src,ref,p,hooks))
+                      n+=1
+              g1=cd.get_evidence('/mnt/data/OrderSafe_EngineGate_Results(1).zip')
+              g2=cd.get_evidence('/mnt/data/OrderSafe_Gate02_Combined_Results.zip')
+              assert delta(g1['A-alone']['policies'][0],g1['A-alone']['hooks'],g1['paired']['hooks'])['status']=='REGRESSION_WITNESS'
+              assert delta(g1['A-alone']['policies'][0],g1['A-alone']['hooks'],g1['guarded']['hooks'])['status']=='NO_REGRESSION_IN_SUPPORTED_MODEL'
+              assert delta(g2['A-alone']['policies'][0],g2['A-alone']['hooks'],g2['paired']['hooks'])['status']=='NO_REGRESSION_IN_SUPPORTED_MODEL'
+              print('BDD TEST PASS',n)
+          
+          if __name__=='__main__':main()
+          PY_BDD_EXACT_PY
+          cat > research/ordersafe_static.py <<'PY_ORDERSAFE_STATIC_PY'
+          #!/usr/bin/env python3
+          """Independent randomized checks and measured (not extrapolated) baselines."""
+          import json,random,time,statistics,sys
+          from pathlib import Path
+          import selector_delta as s
+          import bdd_exact as b
+          rng=random.Random(20261027)
+          results={'seed':20261027,'tests':0,'scope':'namespaced exact tuple matching, selectors, CREATE/UPDATE'}
+          def rand_sel():
+              es=[]
+              for _ in range(rng.randint(0,3)):
+                  op=rng.choice(['In','NotIn','Exists','DoesNotExist'])
+                  es.append({'key':rng.choice(['x','y','z']),'operator':op,
+                             'values':[rng.choice(['v','w'])] if op in ('In','NotIn') else []})
+              return {'matchExpressions':es}
+          for op in ('CREATE','UPDATE'):
+              for _ in range(400):
+                  pol=s.p('P','configmaps',op,rand_sel(),rand_sel())
+                  hooks=[s.h(['P'],'configmaps',op,rand_sel(),rand_sel()) for _ in range(rng.randint(0,3))]
+                  expect=s.small_brute(pol,hooks)
+                  got=b.check(pol,hooks)['status']=='UNREACHABLE_PREFILTER'
+                  assert got==expect, ('MDD-vs-exhaustive',op,pol,hooks)
+                  results['tests']+=1
+          # Gate02 bounded enumerator stops above 200,000 states; the MDD never enumerates.
+          labels={'k'+str(i):'v'+str(i) for i in range(18)}
+          pol=s.p('large','configmaps','UPDATE',{'matchLabels':labels})
+          hooks=[s.h(['large'],'configmaps','UPDATE',{'matchLabels':{'k0':'z'}})]
+          large=b.check(pol,hooks)
+          assert large['status']=='UNREACHABLE_PREFILTER'
+          assert large['stats']['symbolic_state_space'] > 10**15
+          results['large_state_case']=large
+          # Five binary-size baseline comparisons against pure exhaustive enumeration.
+          rows=[]
+          for n in range(1,6):
+              x={f'k{i}':'v' for i in range(n)}
+              p=s.p('base','configmaps','UPDATE',{'matchLabels':x})
+              hs=[s.h(['base'],'configmaps','UPDATE',{'matchLabels':x})]
+              t=time.perf_counter();expect=s.small_brute(p,hs);brute=(time.perf_counter()-t)*1000
+              t=time.perf_counter();got=b.check(p,hs);comp=(time.perf_counter()-t)*1000
+              assert expect is False and got['status']=='COVERED_IN_SUPPORTED_MODEL'
+              rows.append({'keys':n,'states':got['stats']['symbolic_state_space'],
+                           'exhaustive_ms':round(brute,5),'mdd_ms':round(comp,5)})
+          results['baseline_comparison']=rows
+          # Adversarial but supported selectors with up to 30 keys and 32 overlapping hooks.
+          stress=[]
+          for n in (4,8,12,20,30):
+              for count in (2,8,16,32):
+                  p=s.p('P','configmaps','UPDATE',{'matchLabels':{'x0':'v'}})
+                  hs=[]
+                  for _ in range(count):
+                      expressions=[]
+                      for key in rng.sample([f'x{i}' for i in range(n)],rng.randint(1,min(n,4))):
+                          op=rng.choice(['In','NotIn','Exists','DoesNotExist'])
+                          expressions.append({'key':key,'operator':op,
+                            'values':[rng.choice(['v','z'])] if op in ('In','NotIn') else []})
+                      hs.append(s.h(['P'],'configmaps','UPDATE',{'matchExpressions':expressions}))
+                  result=b.check(p,hs)
+                  stress.append({'keys':n,'hooks':count,'status':result['status'],
+                                 'mdd_nodes':result['stats']['created_nodes'],
+                                 'milliseconds':result['runtime_ms']})
+          results['stress']=stress;results['tests']+=1+5+len(stress)
+          Path('evidence/static-pilot.json').write_text(json.dumps(results,indent=2))
+          print('STATIC PILOT PASS',results['tests'],'largest virtual space',large['stats']['symbolic_state_space'])
+          PY_ORDERSAFE_STATIC_PY
+          cat > research/ordersafe_postcheck.py <<'PY_ORDERSAFE_POSTCHECK_PY'
+          #!/usr/bin/env python3
+          import json,sys,traceback
+          from pathlib import Path
+          import selector_delta as s
+          import bdd_exact as b
+          root=Path('evidence')
+          def load(name):return json.loads((root/name).read_text())
+          def snap(name):
+              pol=load('policies-'+name+'.json')['items']
+              wh=[w for cfg in load('webhooks-'+name+'.json')['items'] for w in cfg.get('webhooks',[])]
+              return pol,wh
+          try:
+              pa,ha=snap('a-alone')
+              pp,hp=snap('paired')
+              pg,hg=snap('with-matchcondition')
+              target=next(p for p in pa if p.get('metadata',{}).get('name')=='ordersafe-a-rbac')
+              twin=next(p for p in pp if p.get('metadata',{}).get('name')=='ordersafe-b-watch-configmaps')
+              probe=load('probe-results.json');oldnew=load('old-new-results.json')
+              d1=b.delta(target,ha,hp)
+              d2=b.delta(target,ha,hg)
+              checks={'A_pair':b.check(target,hp), 'A_guard':b.check(target,hg),
+                      'B_pair':b.check(twin,hp), 'B_guard':b.check(twin,hg)}
+              base_ok=(probe['a_alone']=='yes' and probe['b_alone']=='yes')
+              observed_lost=(probe['a_alone']=='yes' and probe['a_pair']!='yes')
+              predicted_lost=d1['status']=='REGRESSION_WITNESS'
+              model_align=('AGREE' if base_ok and observed_lost==predicted_lost else
+                           'INCONCLUSIVE_BASELINE' if not base_ok else 'DISAGREE')
+              guard_ok=(probe['a_guard']=='yes' and probe['b_guard']=='yes'
+                        and d2['status']=='NO_REGRESSION_IN_SUPPORTED_MODEL')
+              oldnew_ok=(oldnew['old_true_new_false']=='yes' and oldnew['old_false_new_true']=='yes')
+              data={'model_runtime_agreement':model_align,'baseline_valid':base_ok,
+                    'pair_observed_loss':observed_lost,'pair_predicted_loss':predicted_lost,
+                    'guarded_control_pass':guard_ok,'old_new_k8s_semantics_pass':oldnew_ok,
+                    'model_delta_pair':d1,'model_delta_guarded':d2,'model_prefilter_checks':checks,
+                    'scope':'admission selector prefilter and observable mutation probe, not general CEL verification',
+                    'novelty_gate':'NOT_ESTABLISHED'}
+          except Exception as ex:
+              data={'model_runtime_agreement':'INCONCLUSIVE_ERROR','reason':str(ex),'traceback':traceback.format_exc(),
+                    'novelty_gate':'NOT_ESTABLISHED'}
+          root.joinpath('causal-algorithm-analysis.json').write_text(json.dumps(data,indent=2,sort_keys=True))
+          print('Causal model-v-runtime:',data['model_runtime_agreement'])
+          PY_ORDERSAFE_POSTCHECK_PY
+          python -m py_compile research/*.py
+          PYTHONPATH=research python research/ordersafe_static.py
+      - name: Create isolated Kubernetes cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.32.0
+          kubectl_version: v1.35.5
+          node_image: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+          cluster_name: ordersafe-causal
+          wait: 180s
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
+      - name: Run identical admission-policy fixtures
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          mkdir -p evidence
+          phase=starting
+          status=BLOCKED_OR_FAILED
+          reason=NOT_COMPLETED
+          runtime_verified=false
+          finish() {
+            local rc=$?
+            if [ "$status" = BLOCKED_OR_FAILED ]; then reason="ERROR_IN_${phase}"; fi
+            jq -n --arg status "$status" --arg reason "$reason" --arg phase "$phase" \
+              --argjson exit_code "$rc" --argjson runtime_verified "$runtime_verified" \
+              '{status:$status, reason:$reason, phase:$phase, exit_code:$exit_code, runtime_verified:$runtime_verified}' \
+              > evidence/summary.json
+            echo "ORDER_SAFE_STATUS=$status; REASON=$reason; PHASE=$phase; EXIT=$rc"
+          }
+          trap finish EXIT
+          
+          # Real, isolated Kubernetes and Kyverno runtime; no existing user cluster is touched.
+          phase=cluster_preflight
+          kubectl version -o json > evidence/kubernetes-version.json
+          kubectl get nodes -o wide > evidence/nodes.txt
+          helm version --short > evidence/helm-version.txt
+          
+          phase=install_kyverno
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update kyverno
+          helm install kyverno kyverno/kyverno --namespace kyverno --create-namespace \
+            --version "${{ matrix.kyverno_chart }}" --wait --timeout 12m
+          helm list -n kyverno -o json > evidence/helm-releases.json
+          kubectl get pods -n kyverno -o wide > evidence/kyverno-pods.txt
+          kubectl wait --for=condition=Established --timeout=120s crd/mutatingpolicies.policies.kyverno.io
+          
+          phase=create_test_namespace
+          NS=ordersafe-gate
+          kubectl create namespace "$NS"
+          
+          # Policy B: mutate UPDATE on specifically labeled ConfigMaps.
+          cat > /tmp/ordersafe-policy-b.yaml <<'POLICY_B'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: ordersafe-b-watch-configmaps
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['']
+                  apiVersions: ['v1']
+                  operations: ['UPDATE']
+                  resources: ['configmaps']
+              objectSelector:
+                matchLabels:
+                  ordersafe.io/watch: 'true'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{
+                      metadata: Object.metadata{
+                        annotations: {"ordersafe.io/mut-b": "yes"}
+                      }
+                    }
+          POLICY_B
+          
+          # Policy A: distinct resource rules and objectSelector, as in the reported issue.
+          cat > /tmp/ordersafe-policy-a.yaml <<'POLICY_A'
+          apiVersion: policies.kyverno.io/v1
+          kind: MutatingPolicy
+          metadata:
+            name: ordersafe-a-rbac
+          spec:
+            failurePolicy: Fail
+            matchConstraints:
+              resourceRules:
+                - apiGroups: ['rbac.authorization.k8s.io']
+                  apiVersions: ['v1']
+                  operations: ['CREATE', 'UPDATE']
+                  resources: ['roles', 'rolebindings']
+              objectSelector:
+                matchLabels:
+                  app.kubernetes.io/component: 'runner-scale-set-listener'
+            mutations:
+              - patchType: ApplyConfiguration
+                applyConfiguration:
+                  expression: >
+                    Object{
+                      metadata: Object.metadata{
+                        annotations: {"ordersafe.io/mut-a": "yes"}
+                      }
+                    }
+          POLICY_A
+          
+          cp /tmp/ordersafe-policy-a.yaml evidence/policy-a.yaml
+          cp /tmp/ordersafe-policy-b.yaml evidence/policy-b.yaml
+          
+          hook_has() {
+            kubectl get mutatingwebhookconfigurations -o json | jq -e --arg p "$1" \
+              '[.items[]? | .webhooks[]? | (.clientConfig.service.path // "") | select(contains($p))] | length > 0' \
+              >/dev/null
+          }
+          wait_hook_present() {
+            for i in $(seq 1 36); do
+              if hook_has "$1"; then sleep 5; return 0; fi
+              sleep 5
+            done
+            echo "Missing expected webhook path for policy: $1" >&2
+            return 1
+          }
+          wait_hook_absent() {
+            for i in $(seq 1 36); do
+              if ! hook_has "$1"; then sleep 5; return 0; fi
+              sleep 5
+            done
+            echo "Webhook path for removed policy still present: $1" >&2
+            return 1
+          }
+          snapshot() {
+            kubectl get mutatingwebhookconfigurations -o json > "evidence/webhooks-$1.json"
+            kubectl get mutatingpolicies.policies.kyverno.io -o json > "evidence/policies-$1.json"
+          }
+          make_cm() {
+            local name="$1" watch="$2"
+            cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: $name
+            labels:
+              ordersafe.io/watch: '$watch'
+          data:
+            phase: before
+          EOF
+          }
+          make_role() {
+            local name="$1"
+            cat <<EOF | kubectl -n "$NS" apply -f - >/dev/null
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: $name
+            labels:
+              app.kubernetes.io/component: runner-scale-set-listener
+          rules: []
+          EOF
+          }
+          probe_b() {
+            local name="$1"
+            make_cm "$name" true
+            kubectl -n "$NS" patch configmap "$name" --type=merge -p '{"data":{"phase":"after"}}' \
+              > "evidence/patch-$name.txt"
+            kubectl -n "$NS" get configmap "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' "evidence/object-$name.json"
+          }
+          probe_a() {
+            local name="$1"
+            make_role "$name"
+            kubectl -n "$NS" get role "$name" -o json > "evidence/object-$name.json"
+            jq -r '.metadata.annotations["ordersafe.io/mut-a"] // "none"' "evidence/object-$name.json"
+          }
+          
+          phase=baseline_b
+          kubectl apply -f /tmp/ordersafe-policy-b.yaml
+          wait_hook_present ordersafe-b-watch-configmaps
+          snapshot b-alone
+          b_alone=$(probe_b ordersafe-b-alone)
+          echo "BASELINE_B=$b_alone"
+          
+          phase=baseline_a
+          kubectl delete -f /tmp/ordersafe-policy-b.yaml --wait=true
+          wait_hook_absent ordersafe-b-watch-configmaps
+          kubectl apply -f /tmp/ordersafe-policy-a.yaml
+          wait_hook_present ordersafe-a-rbac
+          snapshot a-alone
+          a_alone=$(probe_a ordersafe-a-alone)
+          echo "BASELINE_A=$a_alone"
+          
+          phase=paired_policies
+          kubectl apply -f /tmp/ordersafe-policy-b.yaml
+          wait_hook_present ordersafe-b-watch-configmaps
+          snapshot paired
+          b_pair=$(probe_b ordersafe-b-pair)
+          a_pair=$(probe_a ordersafe-a-pair)
+          echo "PAIR_B=$b_pair; PAIR_A=$a_pair"
+          
+          phase=workaround_control
+          kubectl patch mutatingpolicy ordersafe-b-watch-configmaps --type=merge \
+            -p '{"spec":{"matchConditions":[{"name":"force-separate-hook","expression":"true"}]}}'
+          # Allow the controller and Kubernetes API server time to publish updated webhook match conditions.
+          sleep 20
+          snapshot with-matchcondition
+          b_guard=$(probe_b ordersafe-b-guard)
+          a_guard=$(probe_a ordersafe-a-guard)
+          echo "GUARD_B=$b_guard; GUARD_A=$a_guard"
+          
+          phase=negative_selector_control
+          make_cm ordersafe-b-negative false
+          kubectl -n "$NS" patch configmap ordersafe-b-negative --type=merge \
+            -p '{"data":{"phase":"after"}}' > evidence/patch-negative.txt
+          kubectl -n "$NS" get configmap ordersafe-b-negative -o json > evidence/object-negative.json
+          negative=$(jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' evidence/object-negative.json)
+          echo "NEGATIVE_B=$negative"
+          
+          
+          phase=old_new_semantics
+          make_cm ordersafe-b-oldtrue true
+          kubectl -n "$NS" patch configmap ordersafe-b-oldtrue --type=merge \
+            -p '{"metadata":{"labels":{"ordersafe.io/watch":"false"}}}' > evidence/patch-oldtrue.txt
+          kubectl -n "$NS" get configmap ordersafe-b-oldtrue -o json > evidence/object-oldtrue.json
+          old_true=$(jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' evidence/object-oldtrue.json)
+          make_cm ordersafe-b-newtrue false
+          kubectl -n "$NS" patch configmap ordersafe-b-newtrue --type=merge \
+            -p '{"metadata":{"labels":{"ordersafe.io/watch":"true"}}}' > evidence/patch-newtrue.txt
+          kubectl -n "$NS" get configmap ordersafe-b-newtrue -o json > evidence/object-newtrue.json
+          new_true=$(jq -r '.metadata.annotations["ordersafe.io/mut-b"] // "none"' evidence/object-newtrue.json)
+          jq -n --arg old_true "$old_true" --arg new_true "$new_true" \
+            '{old_true_new_false:$old_true,old_false_new_true:$new_true}' > evidence/old-new-results.json
+          
+          phase=decision
+          printf 'stage\tA_mutated\tB_mutated\nB_only\tNA\t%s\nA_only\t%s\tNA\nA_plus_B\t%s\t%s\nA_plus_B_guard\t%s\t%s\nnegative_label\tNA\t%s\n' \
+            "$b_alone" "$a_alone" "$a_pair" "$b_pair" "$a_guard" "$b_guard" "$negative" \
+            > evidence/stage-results.tsv
+          jq -n --arg b_alone "$b_alone" --arg a_alone "$a_alone" \
+            --arg b_pair "$b_pair" --arg a_pair "$a_pair" \
+            --arg b_guard "$b_guard" --arg a_guard "$a_guard" --arg negative "$negative" \
+            '{b_alone:$b_alone,a_alone:$a_alone,b_pair:$b_pair,a_pair:$a_pair,b_guard:$b_guard,a_guard:$a_guard,negative:$negative}' \
+            > evidence/probe-results.json
+          runtime_verified=true
+          if [ "$a_alone" != yes ] || [ "$b_alone" != yes ]; then
+            status=INCONCLUSIVE_BASELINE
+            reason=ONE_OR_BOTH_POLICIES_FAILED_ALONE
+          elif [ "$negative" != none ]; then
+            status=INCONCLUSIVE_SELECTOR
+            reason=NEGATIVE_CONTROL_WAS_MUTATED
+          elif [ "$a_pair" = yes ] && [ "$b_pair" = yes ]; then
+            status=NO_COMPOSITION_DEFECT_OBSERVED
+            reason=BOTH_POLICIES_MUTATED_IN_PAIR
+          elif [ "$a_guard" = yes ] && [ "$b_guard" = yes ]; then
+            status=COMPOSITION_DEFECT_REPRODUCED
+            reason=PAIR_LOST_MUTATION_AND_MATCHCONDITION_RESTORED_IT
+          else
+            status=INCONCLUSIVE_COMPOSITION_FAILURE
+            reason=PAIR_FAILED_BUT_WORKAROUND_DID_NOT_RECOVER_BOTH
+          fi
+          echo "Scientific classification: $status"
+      - name: Verify causal delta and match runtime
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          if [ -f evidence/policies-a-alone.json ] && [ -f evidence/policies-paired.json ] && [ -f evidence/policies-with-matchcondition.json ]; then
+            PYTHONPATH=research python research/ordersafe_postcheck.py
+          else
+            echo '{"model_runtime_agreement":"INCONCLUSIVE_NO_SNAPSHOTS","novelty_gate":"NOT_ESTABLISHED"}' > evidence/causal-algorithm-analysis.json
+          fi
+      - name: Capture diagnostic evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          { kubectl get mutatingwebhookconfigurations -o yaml || true; } > evidence/final-webhooks.yaml 2>&1
+          { kubectl get mutatingpolicies.policies.kyverno.io -o yaml || true; } > evidence/final-policies.yaml 2>&1
+          { kubectl get pods -n kyverno -o wide || true; } > evidence/final-pods.txt 2>&1
+          { kubectl logs -n kyverno deployment/kyverno-admission-controller --all-containers --tail=300 || true; } > evidence/kyverno-admission.log 2>&1
+          { kubectl get events -n kyverno --sort-by='.lastTimestamp' || true; } > evidence/kyverno-events.txt 2>&1
+          if [ ! -s evidence/summary.json ]; then
+            printf '%s\n' '{"status":"BLOCKED_BEFORE_PROBE","reason":"WORKFLOW_SETUP_FAILURE","runtime_verified":false}' > evidence/summary.json
+          fi
+      - name: Upload evidence even on failed engines
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderSafe_Gate03_${{ matrix.kyverno_chart }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14
+  collect:
+    needs: engine
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download both version artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: OrderSafe_Gate03_*
+          path: all-evidence
+      - name: Build one consolidated archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import json,zipfile,glob,os,pathlib
+          root=pathlib.Path('all-evidence')
+          statuses={}
+          for fold in sorted(root.iterdir()) if root.exists() else []:
+              if not fold.is_dir(): continue
+              def j(name):
+                  p=fold/name
+                  if not p.exists():return None
+                  try:return json.loads(p.read_text())
+                  except Exception as e:return {'parse_error':str(e)}
+              statuses[fold.name]={
+                  'engine':j('summary.json'),'probe':j('probe-results.json'),
+                  'causal':j('causal-algorithm-analysis.json'),
+                  'old_new':j('old-new-results.json'),
+                  'static_tests':(j('static-pilot.json') or {}).get('tests')}
+          versions=list(statuses)
+          agreement=all((v.get('causal') or {}).get('model_runtime_agreement')=='AGREE' for v in statuses.values())
+          body={'matched_versions':versions,'by_version':statuses,
+                'same_fixtures':True,'matching_success':agreement and len(versions)==2,
+                'novelty_gate':'NOT_ESTABLISHED',
+                'limitations':['known defect may be fixed','RBAC readiness must be checked',
+                               'MDD is a standard representation; 8.5 novelty unproven',
+                               'nontrivial CEL, backend errors and mutation order are out of scope']}
+          pathlib.Path('Gate03_Combined_Summary.json').write_text(json.dumps(body,indent=2))
+          with zipfile.ZipFile('OrderSafe_Gate03_Combined_Results.zip','w',compression=zipfile.ZIP_DEFLATED) as z:
+              z.write('Gate03_Combined_Summary.json')
+              for file in sorted(root.rglob('*')):
+                  if file.is_file():z.write(file)
+          print('Combined summary:',body['matching_success'],versions)
+          PY
+      - name: Upload single result ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderSafe_Gate03_Combined_Results
+          path: OrderSafe_Gate03_Combined_Results.zip
+          if-no-files-found: error
+          retention-days: 14
