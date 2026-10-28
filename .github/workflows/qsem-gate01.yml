@@ -1,0 +1,362 @@
+name: QSEM Gate01 Independent Source and Logic
+'on':
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Run read-only source audit and logic tests
+        shell: bash
+        run: |
+          set -eu
+          cat > qsem_gate.py <<'QSEM_PILOT_PY'
+          #!/usr/bin/env python3
+          """Q-SEM restricted query preservation pilot; NO claim of full PromQL semantics.
+          
+          Stable external examples are identified by source URLs. Network audit is optional
+          because local execution environments may be offline. Fails closed on unknown
+          semantics rather than making unverifiable query rewrites.
+          """
+          import argparse
+          import collections
+          import hashlib
+          import json
+          import math
+          import random
+          import re
+          import statistics
+          import sys
+          import time
+          import urllib.request
+          from pathlib import Path
+          
+          OLD = 'http_server_duration_milliseconds_'
+          NEW = 'http_server_request_duration_seconds_'
+          OLDCLIENT = 'http_client_duration_milliseconds_'
+          NEWCLIENT = 'http_client_request_duration_seconds_'
+          KNOWN = {'CONNECT','DELETE','GET','HEAD','OPTIONS','PATCH','POST','PUT','TRACE'}
+          UNIVERSE = sorted(KNOWN | {'BREW','PROPFIND','CUSTOM','_OTHER'})
+          
+          def method_map(x):
+              return x if x in KNOWN else '_OTHER'
+          
+          def unquoted_labels(expression, key):
+              # Example: http_method="GET", or http_method=~"GET|POST".
+              pattern = r'\b'+ re.escape(key) + r'\s*(=~|!~|!=|=)\s*"((?:\\.|[^"\\])*)"'
+              return list(re.finditer(pattern, expression))
+          
+          def predicate(x, op, pattern):
+              if op == '=': return x == pattern
+              if op == '!=': return x != pattern
+              if op == '=~': return bool(re.fullmatch(pattern,x))
+              if op == '!~': return not bool(re.fullmatch(pattern,x))
+              raise ValueError(op)
+          
+          def fibre_witness(op, pattern, universe=UNIVERSE):
+              """Returns a counterexample if a predicate fails to factor through method_map.
+              The complete universe is the declared pilot domain, not all HTTP strings.
+              """
+              fibres = collections.defaultdict(list)
+              for x in universe: fibres[method_map(x)].append(x)
+              for group in fibres.values():
+                  for i,a in enumerate(group):
+                      for b in group[i+1:]:
+                          if predicate(a,op,pattern) != predicate(b,op,pattern):
+                              return {'old_a':a,'old_b':b,'new_a':method_map(a),'new_b':method_map(b),
+                                      'predicate_a':predicate(a,op,pattern),'predicate_b':predicate(b,op,pattern)}
+              return None
+          
+          # Real-world query examples independently published; manually curated, not crawled live.
+          EXAMPLES = []
+          def add(source, name, expr):
+              EXAMPLES.append({'source':source,'name':name,'query':expr,'origin':'published_expression'})
+          DASH = 'https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json'
+          PACKT = 'https://github.com/PacktPublishing/Observability-with-Grafana'
+          ISSUE = 'https://github.com/open-telemetry/opentelemetry-python-contrib/issues/3011'
+          GRAFANA = 'https://grafana.com/blog/opentelemetry-with-prometheus-better-integration-through-resource-attribute-promotion/'
+          for p in ('0.5','0.75','0.9','0.95','0.98','0.99','0.999'):
+              add(DASH,'dashboard_histogram_quantile_'+p,
+                  'histogram_quantile('+p+', sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job="$exported_job", exported_instance="$exported_instance"}[5m])))')
+          add(DASH,'dashboard_error_4xx5xx', 'sum(rate(http_server_duration_milliseconds_count{exported_job="$exported_job", exported_instance="$exported_instance", http_status_code=~"4..|5.."}[5m]))')
+          add(DASH,'dashboard_error_4xx', 'sum(rate(http_server_duration_milliseconds_count{exported_job="$exported_job", exported_instance="$exported_instance", http_status_code=~"4.."}[5m]))')
+          add(DASH,'dashboard_error_5xx', 'sum(rate(http_server_duration_milliseconds_count{exported_job="$exported_job", exported_instance="$exported_instance", http_status_code=~"5.."}[5m]))')
+          add(DASH,'dashboard_request_max', 'sum by (scheme) (max_over_time(http_server_duration_milliseconds_count{exported_job="$exported_job",exported_instance="$exported_instance"}[$__rate_interval]))')
+          add(PACKT,'packt_p95','histogram_quantile(0.95, sum(rate(http_server_duration_milliseconds_bucket{}[$__rate_interval])) by (le))')
+          add(ISSUE,'real_issue_old_bucket_rate','sum(rate(http_server_duration_milliseconds_bucket{app="x", environment="dev"}[$__rate_interval])) by (le)')
+          add(ISSUE,'real_issue_new_bucket_rate','sum(rate(http_server_request_duration_seconds_bucket{app="x", environment="dev"}[$__rate_interval])) by (le)')
+          add(GRAFANA,'grafana_recent_p95','histogram_quantile(0.95, sum by(le, deployment_environment_name, service_namespace, service_name) (rate(http_server_request_duration_seconds_bucket{deployment_environment_name=~"$deployment_environment_name", service_namespace=~"$service_namespace", service_name="$service_name"}[$__rate_interval])))')
+          
+          # Not external examples. They are explicit adversarial probes.
+          PROBES = [
+           ('standard_method', 'sum(rate(http_server_duration_milliseconds_count{http_method="GET"}[5m]))'),
+           ('collapsed_method', 'sum(rate(http_server_duration_milliseconds_count{http_method="PROPFIND"}[5m]))'),
+           ('other_method', 'sum(rate(http_server_duration_milliseconds_count{http_method="_OTHER"}[5m]))'),
+           ('method_regex', 'sum(rate(http_server_duration_milliseconds_count{http_method=~"GET|POST"}[5m]))'),
+           ('method_negation', 'sum(rate(http_server_duration_milliseconds_count{http_method!="PROPFIND"}[5m]))'),
+           ('grouped_by_method', 'sum by (http_method) (rate(http_server_duration_milliseconds_count[5m]))'),
+           ('milliseconds_sum', 'sum(rate(http_server_duration_milliseconds_sum{http_status_code="200"}[5m]))'),
+           ('average_duration', 'sum(rate(http_server_duration_milliseconds_sum[5m])) / sum(rate(http_server_duration_milliseconds_count[5m]))'),
+           ('host_changed', 'sum(rate(http_server_duration_milliseconds_count{net_host_name="foo"}[5m]))'),
+           ('new_already', 'sum(rate(http_server_request_duration_seconds_count[5m]))'),
+          ]
+          
+          def _replace_sum_rates(expr):
+              # Convert historical milliseconds sums into modern seconds with explicit
+              # per-rate factor; leave other PromQL trees structurally untouched.
+              root_names = '(?:'+re.escape(OLD)+'|'+re.escape(OLDCLIENT)+')sum'
+              pat = re.compile(r'\brate\s*\(\s*('+root_names+r')\s*(\{[^{}]*\})?\s*\[([^\[\]]+)\]\s*\)')
+              def transform(m):
+                  name = m.group(1)
+                  new_name = name.replace(OLD,NEW).replace(OLDCLIENT,NEWCLIENT)
+                  return '(1000 * rate(' + new_name + (m.group(2) or '') + '['+m.group(3)+']))'
+              return pat.subn(transform,expr)
+          
+          def migrate(query, mode='exclusive'):
+              reasons=[]; detail={}; q=query
+              # The pilot does not claim to understand PromQL's full AST.
+              old_used=bool(re.search(re.escape(OLD) + r'(?:bucket|sum|count)\b',q)) or OLDCLIENT in q
+              new_used=NEW in q or NEWCLIENT in q
+              if not old_used:
+                  return {'decision':'ALREADY_NEW' if new_used else 'UNSUPPORTED','reasons':['NO_LEGACY_METRIC'], 'rewrite':None}
+              if old_used and new_used:
+                  return {'decision':'PROVENANCE_REQUIRED','reasons':['OLD_AND_NEW_REFERENCED'], 'rewrite':None}
+              if mode != 'exclusive':
+                  return {'decision':'PROVENANCE_REQUIRED','reasons':['DUPLICATED_OR_MIXED_SOURCE_UNPARTITIONED'], 'rewrite':None}
+              if re.search(r'histogram_quantile\s*\(',q):
+                  return {'decision':'REJECT_BUCKET_LAYOUT','reasons':['PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF'],'rewrite':None}
+              if re.search(re.escape(OLD)+r'bucket\b',q) or re.search(re.escape(OLDCLIENT)+r'bucket\b',q):
+                  return {'decision':'REJECT_BUCKET_LAYOUT','reasons':['BUCKET_VECTOR_LAYOUT_NOT_VERIFIED'],'rewrite':None}
+              if re.search(r'\b(?:by|without)\s*\([^)]*\bhttp_method\b',q):
+                  detail['witness']={'old_a':'BREW','old_b':'PROPFIND','new_a':'_OTHER','new_b':'_OTHER'}
+                  return {'decision':'PROVEN_IMPOSSIBLE','reasons':['GROUP_LABEL_COLLAPSE'], 'detail':detail,'rewrite':None}
+              for m in unquoted_labels(q,'http_method'):
+                  op,pattern=m.group(1),m.group(2)
+                  if op in ('=~','!~') and not re.fullmatch(r'[A-Z_]+(?:\|[A-Z_]+)*',pattern):
+                      return {'decision':'UNSUPPORTED','reasons':['REGEX_OUTSIDE_PROVEN_SUBSET'],'rewrite':None}
+                  try: witness=fibre_witness(op,pattern)
+                  except re.error:
+                      return {'decision':'UNSUPPORTED','reasons':['UNSUPPORTED_METHOD_REGEX'],'rewrite':None}
+                  if witness:
+                      return {'decision':'PROVEN_IMPOSSIBLE','reasons':['METHOD_VALUE_COLLAPSE'], 'detail':{'witness':witness},'rewrite':None}
+              # Refuse changes in meaning/source/optional existence rather than treating
+              # all similarly-named legacy attributes as unconditional renames.
+              if re.search(r'\b(http_scheme|net_host_name|net_host_port|net_peer_name|net_peer_port)\b',q):
+                  return {'decision':'NEEDS_SEMANTIC_REVIEW','reasons':['FIELD_SEMANTICS_OR_EMISSION_CHANGED'],'rewrite':None}
+              if re.search(r'\b(?:on|ignoring|group_left|group_right)\s*\(',q):
+                  return {'decision':'UNSUPPORTED','reasons':['VECTOR_MATCHING_SCOPE_NOT_VALIDATED'],'rewrite':None}
+              # Fail closed on unknown old metric forms and temporal aggregation of _sum
+              # when unit factor is not applied through a supported rate() expression.
+              q,n_sum=_replace_sum_rates(q)
+              q=q.replace(OLD+'count',NEW+'count').replace(OLDCLIENT+'count',NEWCLIENT+'count')
+              q=q.replace('http_status_code','http_response_status_code')
+              q=q.replace('http_method','http_request_method')
+              if OLD in q or OLDCLIENT in q:
+                  return {'decision':'UNSUPPORTED','reasons':['UNREWRITTEN_LEGACY_TOKEN'], 'rewrite':None}
+              if not re.search(r'\b(?:rate|max_over_time|increase)\s*\(',q):
+                  return {'decision':'UNSUPPORTED','reasons':['TEMPORAL_SEMANTICS_NOT_VALIDATED'],'rewrite':None}
+              if not (re.search(re.escape(NEW)+r'count\b',q) or re.search(re.escape(NEW)+r'sum\b',q) or re.search(re.escape(NEWCLIENT)+r'(?:count|sum)\b',q)):
+                  return {'decision':'UNSUPPORTED','reasons':['METRIC_NOT_RECOGNIZED'],'rewrite':None}
+              return {'decision':'CONDITIONAL_REWRITE','reasons':['REQUIRES_EXPORTER_EQUIVALENCE','REQUIRES_EXCLUSIVE_EMISSION','REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS'], 'rewrite':q,'sum_rates_scaled':n_sum}
+          
+          def offline_oracle_test(seed=19, n=15000):
+              rng=random.Random(seed)
+              # Exhaustive on all declared method subsets for a few domains; random on full domain.
+              failures=0; verified=0
+              for _ in range(n):
+                  subset=set(x for x in UNIVERSE if rng.getrandbits(1))
+                  # Algebraic oracle: property is fibre constant over declared universe.
+                  witness=None
+                  for a in UNIVERSE:
+                      for b in UNIVERSE:
+                          if method_map(a)==method_map(b) and ((a in subset)!=(b in subset)):
+                              witness=(a,b);break
+                      if witness:break
+                  # Algorithmic independent implementation: each fibre's selected values
+                  # must be either none or all.
+                  fibres=collections.defaultdict(list)
+                  for x in UNIVERSE: fibres[method_map(x)].append(x)
+                  alg=all((not any(x in subset for x in v)) or all(x in subset for x in v) for v in fibres.values())
+                  oracle=(witness is None)
+                  verified+=1
+                  if alg!=oracle:failures+=1
+              return {'tested':verified,'failures':failures,'seed':seed}
+          
+          def numeric_rewrite_property_test(seed=37, trials=3000):
+              """Event-level reference: count and ms sum under 1:1 event migration.
+              Constructed data, not any real telemetry trace or full PromQL execution.
+              """
+              rng=random.Random(seed)
+              mismatches=0
+              for _ in range(trials):
+                  n=rng.randint(1,80)
+                  # Use integer microseconds to avoid tolerance-sensitive floats.
+                  dur_micro=[rng.randint(10,5_000_000) for _ in range(n)]
+                  codes=[rng.choice([200,201,301,400,401,404,500,503]) for _ in range(n)]
+                  old_count=sum(1 for c in codes if str(c).startswith(('4','5')))
+                  new_count=sum(1 for c in codes if str(c).startswith(('4','5')))
+                  old_ms_sum=sum(d/1000 for d in dur_micro)
+                  new_s_sum=sum(d/1_000_000 for d in dur_micro)
+                  if old_count != new_count or not math.isclose(old_ms_sum,1000*new_s_sum,rel_tol=1e-12,abs_tol=1e-8):
+                      mismatches+=1
+              return {'trials':trials,'mismatches':mismatches,'seed':seed,
+                      'assumption':'same events, known exporter unit conversion, exclusive emission'}
+          
+          def bucket_witness():
+              # Constructed, assumption-scoped: old has 0.5s edge, new first edge 5s.
+              # The instance reported in #3011 indicates an actual bucket mismatch; it
+              # does NOT assert these as its precise original boundaries.
+              old_edge=.5; new_edges=[5.,10.,20.]
+              a=.25; b=.75
+              def cdf(x,edges):return [int(x<=e) for e in edges]
+              return {'old_edge_seconds':old_edge,'new_edges_seconds':new_edges,
+                      'duration_a_seconds':a,'duration_b_seconds':b,
+                      'same_new_vector':cdf(a,new_edges)==cdf(b,new_edges),
+                      'different_old_bin':int(a<=old_edge)!=int(b<=old_edge),
+                      'scope':'constructed bucket-layout counterexample, not instrument default'}
+          
+          def mixed_witness():
+              # These two event worlds have identical OLD/NEW aggregate counts.
+              old=set(range(1,6))
+              new_disjoint=set(range(6,9))
+              new_overlap=set(range(1,4))
+              return {'old_observed_count':len(old),'new_observed_count':3,
+                      'world_disjoint_unique_events':len(old|new_disjoint),
+                      'world_overlap_unique_events':len(old|new_overlap),
+                      'observations_identical':True,
+                      'scope':'no event provenance or guaranteed emission partition'}
+          
+          AUDIT_SOURCES = {
+           'semconv_old': 'https://raw.githubusercontent.com/open-telemetry/opentelemetry-specification/v1.20.0/specification/metrics/semantic_conventions/http-metrics.md',
+           'semconv_new': 'https://raw.githubusercontent.com/open-telemetry/semantic-conventions/v1.23.1/docs/http/http-metrics.md',
+           'dashboard_old': 'https://raw.githubusercontent.com/isaacOjeda/DevToPosts/main/OpenTelemetryExample/resources/grafana-dashboard-02.json',
+           'issue_bucket': 'https://api.github.com/repos/open-telemetry/opentelemetry-python-contrib/issues/3011',
+          }
+          
+          def audit_online(timeout=15):
+              results={}
+              for kind,url in AUDIT_SOURCES.items():
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'QSEM-feasibility-audit','Accept':'application/json,text/plain'})
+                      with urllib.request.urlopen(req,timeout=timeout) as resp: data=resp.read(2_500_000)
+                      decoded=data.decode('utf-8','replace')
+                      needles={'semconv_old':['http.server.duration','ms'], 'semconv_new':['http.server.request.duration','s'],
+                               'dashboard_old':[OLD+'bucket',OLD+'count'], 'issue_bucket':['bucket','http_server_request_duration_seconds_bucket']}
+                      found=all(s in decoded for s in needles[kind])
+                      results[kind]={'status':'VERIFIED' if found else 'MISMATCH','bytes':len(data), 'sha256':hashlib.sha256(data).hexdigest(), 'url':url}
+                      if kind=='dashboard_old' and found:
+                          dash=json.loads(decoded)
+                          exprs=[]
+                          def walk(o):
+                              if isinstance(o,dict):
+                                  if isinstance(o.get('expr'),str) and o['expr'].strip(): exprs.append(o['expr'])
+                                  for v in o.values(): walk(v)
+                              elif isinstance(o,list):
+                                  for v in o:walk(v)
+                          walk(dash)
+                          results[kind]['extracted_queries']=len(exprs)
+                          results[kind]['with_old_metric']=sum(OLD in s for s in exprs)
+                          results[kind]['query_sha256']=hashlib.sha256(json.dumps(exprs,sort_keys=True).encode()).hexdigest()
+                          # Audit all live extracted expressions, not only curated exemplars.
+                          results[kind]['classifications']=dict(collections.Counter(migrate(e)['decision'] for e in exprs if OLD in e))
+                  except Exception as e:
+                      results[kind]={'status':'FETCH_FAILED','reason':str(e)[:200],'url':url}
+              return results
+          
+          def run(out, online=False):
+              out=Path(out);out.mkdir(parents=True,exist_ok=True)
+              t0=time.monotonic()
+              items=[]
+              for e in EXAMPLES:
+                  items.append(dict(e,result=migrate(e['query'])))
+              for name,q in PROBES:
+                  items.append({'origin':'constructed_probe','source':None,'name':name,'query':q,'result':migrate(q)})
+              decisions=dict(collections.Counter(r['result']['decision'] for r in items))
+              tests=offline_oracle_test()
+              numeric_tests=numeric_rewrite_property_test()
+              bucket=bucket_witness(); mixed=mixed_witness()
+              assertions={
+                  'method_oracle_no_mismatch':tests['failures']==0,
+                  'numeric_rewrite_property_no_mismatch':numeric_tests['mismatches']==0,
+                  'old_metric_new_metric_differ':OLD!=NEW,
+                  'bucket_witness_true':bucket['same_new_vector'] and bucket['different_old_bin'],
+                  'mixed_witness_true':mixed['observations_identical'] and mixed['world_disjoint_unique_events']!=mixed['world_overlap_unique_events'],
+                  'get_rewritable':migrate(PROBES[0][1])['decision']=='CONDITIONAL_REWRITE',
+                  'lossy_method_refused':migrate(PROBES[1][1])['decision']=='PROVEN_IMPOSSIBLE',
+                  'group_method_refused':migrate(PROBES[5][1])['decision']=='PROVEN_IMPOSSIBLE',
+                  'sum_ms_scaled': '1000 * rate(' in migrate(PROBES[6][1])['rewrite'],
+                  'histogram_quantile_refused':migrate(EXAMPLES[0]['query'])['decision']=='REJECT_BUCKET_LAYOUT',
+                  'host_semantics_refused':migrate(PROBES[8][1])['decision']=='NEEDS_SEMANTIC_REVIEW',
+                  'exclusive_mode_guard':migrate(PROBES[0][1],mode='mixed')['decision']=='PROVENANCE_REQUIRED',
+              }
+              if online:
+                  sources=audit_online()
+                  source_gate=all(x['status']=='VERIFIED' for x in sources.values())
+              else:
+                  sources={'status':'NOT_RUN_OFFLINE_LOCAL','reason':'network disabled; GitHub run will verify sources'}
+                  source_gate=None
+              summary={
+                  'project':'Q-SEM','phase':'offline feasibility gate; not a publication benchmark',
+                  'scope':'restricted PromQL leaf transformations and label predicate factorizability',
+                  'source_gate_verified':source_gate,
+                  'real_examples_curated':len(EXAMPLES),'constructed_probes':len(PROBES),
+                  'decision_counts_all':decisions,
+                  'decision_counts_external':dict(collections.Counter(x['result']['decision'] for x in items if x['origin']=='published_expression')),
+                  'method_oracle':tests,'numeric_rewrite_property':numeric_tests,'bucket_nonidentifiability':bucket,'mixed_emission_nonidentifiability':mixed,
+                  'selftest_assertions':assertions,'selftest_pass':sum(assertions.values()),'selftest_total':len(assertions),
+                  'duration_ms':round(1000*(time.monotonic()-t0),2),
+                  'scientific_novelty':'NOT_ESTABLISHED',
+                  'limitations':['No complete PromQL grammar or parser used','No exporter or back-end metric parity verified',
+                      'Sources curated from publicly accessible documents; live audit only in --online mode',
+                      'No raw real metric time-series data','View determinacy is established prior art',
+                      'Bucket proof uses constructed layout, not claim about all instrumentation defaults',
+                      'Supports HTTP server/client count/sum, rejects quantile or ambiguous semantic transforms',
+                      'No automatic query rewrite accepted without deployment assumptions']}
+              (out/'summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8')
+              (out/'decisions.json').write_text(json.dumps(items,indent=2,ensure_ascii=False),encoding='utf-8')
+              (out/'source_audit.json').write_text(json.dumps(sources,indent=2,ensure_ascii=False),encoding='utf-8')
+              text=['Q-SEM FEASIBILITY GATE','',f'Published query examples (curated): {len(EXAMPLES)}',
+                    f'Constructed probes: {len(PROBES)}',f'Method-space randomized checks: {tests["tested"]}; mismatches: {tests["failures"]}',
+                    f'Event-level numeric checks (constructed): {numeric_tests["trials"]}; mismatches: {numeric_tests["mismatches"]}',
+                    f'Selftests: {sum(assertions.values())}/{len(assertions)}',f'Decisions: {decisions}',
+                    f'Online source audit: {source_gate}', 'Novelty: NOT ESTABLISHED', '',
+                    'THIS IS A PILOT, NOT AN EMPIRICAL CLAIM ABOUT PRODUCTION TELEMETRY.',
+                    'Reason: view determinacy is prior art; bucket and provenance witnesses alone are not original algorithms.']
+              (out/'README_RESULTS.txt').write_text('\n'.join(text)+'\n',encoding='utf-8')
+              print('\n'.join(text))
+              if not all(assertions.values()) or (online and not source_gate):
+                  return 2
+              return 0
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser();p.add_argument('--out',default='QSEM_Gate01_Results');p.add_argument('--online',action='store_true')
+              args=p.parse_args();sys.exit(run(args.out,args.online))
+          
+          QSEM_PILOT_PY
+          python -m py_compile qsem_gate.py
+          python qsem_gate.py --out QSEM_Gate01_Results --online
+      - name: Preserve diagnostic output
+        if: always()
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p QSEM_Gate01_Results
+          python - <<'PYZIP'
+          from pathlib import Path
+          import zipfile
+          p=Path('QSEM_Gate01_Results')
+          with zipfile.ZipFile(p/'QSEM_Gate01_Results.zip','w',zipfile.ZIP_DEFLATED) as z:
+              for f in sorted(p.glob('*')):
+                  if f.is_file() and f.suffix != '.zip': z.write(f,f.name)
+          print('ZIP_BYTES', (p/'QSEM_Gate01_Results.zip').stat().st_size)
+          PYZIP
+      - name: Upload combined results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSEM_Gate01_Results
+          path: QSEM_Gate01_Results/QSEM_Gate01_Results.zip
+          if-no-files-found: error
+          retention-days: 14
