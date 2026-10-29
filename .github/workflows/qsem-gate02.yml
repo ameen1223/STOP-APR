@@ -1,0 +1,1007 @@
+name: QSEM Gate02 Integrity and Alert Certificates
+'on':
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Materialize frozen Gate01 corpus and hardened analyzer
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p QSEM_Gate02_Results
+          cat > qsem_core.py <<'QSEM_CORE_02'
+          #!/usr/bin/env python3
+          """Q-SEM Gate02, conservative migration / histogram decision certificate pilot.
+          
+          Scope: a fail-closed subset of PromQL, HTTP *_count and rate/increase(*_sum),
+          modelled under exporter equivalence / exclusive emission. This is NOT a
+          complete PromQL implementation and is NOT a general semantic guarantee.
+          Original Gate01 and its evidence are unmodified.
+          """
+          from __future__ import annotations
+          import bisect
+          import collections
+          from dataclasses import dataclass
+          import json
+          import math
+          import random
+          import re
+          import sys
+          from pathlib import Path
+          
+          OLD = 'http_server_duration_milliseconds_'
+          NEW = 'http_server_request_duration_seconds_'
+          OLDCLIENT = 'http_client_duration_milliseconds_'
+          NEWCLIENT = 'http_client_request_duration_seconds_'
+          KNOWN = {'CONNECT', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT', 'TRACE'}
+          UNIVERSE = sorted(KNOWN | {'BREW', 'PROPFIND', 'CUSTOM', '_OTHER'})
+          MAPPING = {'http_status_code': 'http_response_status_code', 'http_method': 'http_request_method'}
+          SENSITIVE = {'http_scheme', 'net_host_name', 'net_host_port', 'net_peer_name', 'net_peer_port'}
+          ALLOWED_FUNCTIONS = {'rate', 'increase', 'max_over_time', 'min_over_time', 'sum', 'avg', 'min', 'max', 'count', 'clamp_min', 'clamp_max'}
+          COUNTER_NAMES = {OLD+'count', OLDCLIENT+'count'}
+          SUM_NAMES = {OLD+'sum', OLDCLIENT+'sum'}
+          BUCKET_NAMES = {OLD+'bucket', OLDCLIENT+'bucket'}
+          NEW_NAMES = {NEW+'count', NEW+'sum', NEW+'bucket', NEWCLIENT+'count', NEWCLIENT+'sum', NEWCLIENT+'bucket'}
+          METRIC_NAMES = COUNTER_NAMES | SUM_NAMES | BUCKET_NAMES
+          IDENT = re.compile(r'[a-zA-Z_:][a-zA-Z_0-9:]*')
+          NUMBER = re.compile(r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+          
+          @dataclass(frozen=True)
+          class Token:
+              kind: str
+              text: str
+              start: int
+              end: int
+          
+          class Refuse(Exception):
+              def __init__(self, decision, reason, detail=None):
+                  self.decision, self.reason, self.detail = decision, reason, detail
+                  super().__init__(reason)
+          
+          
+          def lex(src: str) -> list[Token]:
+              """PromQL token boundaries, NOT a replacement for a full grammar parser."""
+              out = []; i = 0
+              while i < len(src):
+                  c = src[i]; a = i
+                  if c.isspace():
+                      i += 1
+                      continue
+                  if c == '#':
+                      e = src.find('\n',i)
+                      i = len(src) if e == -1 else e
+                      continue
+                  if c in ('"', "'", '`'):
+                      q = c; i+=1; escaped=False
+                      while i < len(src):
+                          x = src[i]
+                          if q != '`' and x == '\\' and not escaped:
+                              escaped=True;i+=1;continue
+                          if x == q and not escaped:
+                              i+=1;break
+                          escaped=False;i+=1
+                      else:
+                          raise Refuse('UNSUPPORTED','UNTERMINATED_STRING')
+                      out.append(Token('string',src[a:i],a,i)); continue
+                  if src.startswith('$__rate_interval', i):
+                      i += len('$__rate_interval')
+                      out.append(Token('macro',src[a:i],a,i)); continue
+                  m = IDENT.match(src,i)
+                  if m:
+                      i=m.end();out.append(Token('ident',m.group(),a,i));continue
+                  m = NUMBER.match(src,i)
+                  if m:
+                      i=m.end();out.append(Token('number',m.group(),a,i));continue
+                  if i+1 < len(src) and src[i:i+2] in ('=~','!~','!=','==','>=','<='):
+                      i+=2;out.append(Token('op',src[a:i],a,i));continue
+                  if c in '{}[](),.:+-*/%^><=!@':
+                      i+=1;out.append(Token('punct',c,a,i));continue
+                  raise Refuse('UNSUPPORTED','UNRECOGNIZED_TOKEN:'+repr(c))
+              return out
+          
+          
+          def pairs(toks: list[Token]) -> dict[int,int]:
+              match={')':'(',']':'[','}':'{'};stack=[];where={}
+              for i,t in enumerate(toks):
+                  if t.text in ('(','[','{') and t.kind!='string': stack.append((t.text,i))
+                  if t.text in (')',']','}') and t.kind!='string':
+                      if not stack or stack[-1][0]!=match[t.text]:
+                          raise Refuse('UNSUPPORTED','INVALID_BRACKET_STRUCTURE')
+                      _,j=stack.pop();where[i]=j;where[j]=i
+              if stack:raise Refuse('UNSUPPORTED','INVALID_BRACKET_STRUCTURE')
+              return where
+          
+          
+          def _quoted_raw(q: str) -> str:
+              if len(q)<2 or q[0] not in ('"',"'",'`') or q[-1]!=q[0]:
+                  raise Refuse('UNSUPPORTED','UNEXPECTED_MATCHER_LITERAL')
+              # RE2/Python regex equivalence is NOT assumed; callers restrict to safe literals.
+              return q[1:-1]
+          
+          
+          def method_map(x):return x if x in KNOWN else '_OTHER'
+          
+          
+          def fibre_witness(op: str, text: str):
+              """Finite-domain witness, explicitly not a proof over all HTTP method strings."""
+              if op in ('=~','!~') and not re.fullmatch(r'[A-Z_]+(?:\|[A-Z_]+)*',text):
+                  raise Refuse('UNSUPPORTED','REGEX_OUTSIDE_PROVEN_SUBSET')
+              try:
+                  def p(x):
+                      eq = (x==text) if op in ('=','!=') else bool(re.fullmatch(text,x))
+                      return eq if op in ('=','=~') else not eq
+                  fibres=collections.defaultdict(list)
+                  for x in UNIVERSE:fibres[method_map(x)].append(x)
+                  for vs in fibres.values():
+                      for a in vs:
+                          for b in vs:
+                              if p(a)!=p(b):
+                                  return {'old_a':a,'old_b':b,'new_a':method_map(a),'new_b':method_map(b),
+                                          'predicate_a':p(a),'predicate_b':p(b),'scope':'finite_method_universe'}
+              except re.error as exc:
+                  raise Refuse('UNSUPPORTED','INVALID_METHOD_REGEX') from exc
+              return None
+          
+          
+          def _metric_rename(name):
+              if name.startswith(OLD):return NEW+name[len(OLD):]
+              if name.startswith(OLDCLIENT):return NEWCLIENT+name[len(OLDCLIENT):]
+              raise Refuse('UNSUPPORTED','UNRECOGNIZED_METRIC')
+          
+          
+          def migrate(query: str, mode: str='exclusive') -> dict:
+              """No code may rewrite a string literal or a label *value*.
+          
+              The optional external PromQL parser validates complete syntax separately;
+              this scanner only authorizes a deliberately small family of rewrite edits.
+              """
+              edits=[]
+              try:
+                  ts=lex(query); matching=pairs(ts)
+                  texts=[t.text for t in ts]
+                  if any(t.text in ('@','offset') and t.kind!='string' for t in ts):
+                      raise Refuse('UNSUPPORTED','TEMPORAL_MODIFIER_OUTSIDE_SCOPE')
+                  for i,t in enumerate(ts):
+                      if t.kind=='ident' and i+1<len(ts) and ts[i+1].text=='(':
+                          if t.text not in ALLOWED_FUNCTIONS and t.text not in ('histogram_quantile','by','without'):
+                              raise Refuse('UNSUPPORTED','FUNCTION_OUTSIDE_SCOPE:'+t.text)
+                  if any(t.kind=='ident' and t.text in ('on','ignoring','group_left','group_right','unless','and','or','bool') for t in ts):
+                      raise Refuse('UNSUPPORTED','VECTOR_MATCHING_OUTSIDE_SCOPE')
+                  if mode!='exclusive':
+                      raise Refuse('PROVENANCE_REQUIRED','DUPLICATED_OR_MIXED_SOURCE_UNPARTITIONED')
+                  # Partition curly braces into matcher selector contexts, capturing only key tokens.
+                  labels={}; grouping={}; metric_positions=set(); all_metric_strings=[]
+                  for i,t in enumerate(ts):
+                      if t.kind=='ident' and t.text in METRIC_NAMES | NEW_NAMES:
+                          all_metric_strings.append((i,t.text))
+                      if t.text=='{' and t.kind!='string':
+                          if i==0 or ts[i-1].kind!='ident' or ts[i-1].text not in METRIC_NAMES | NEW_NAMES:
+                              raise Refuse('UNSUPPORTED','OTHER_METRIC_OR_UNSCOPED_MATCHER')
+                          j=matching[i]; n=i+1
+                          while n<j:
+                              if ts[n].text==',':n+=1;continue
+                              if n+2>=j or ts[n].kind!='ident' or ts[n+1].text not in ('=', '!=','=~','!~') or ts[n+2].kind!='string':
+                                  raise Refuse('UNSUPPORTED','COMPLEX_OR_INVALID_LABEL_SELECTOR')
+                              labels[n]=(ts[n+1].text,_quoted_raw(ts[n+2].text))
+                              n+=3
+                              if n<j and ts[n].text!=',':
+                                  raise Refuse('UNSUPPORTED','MALFORMED_MATCHER_SEPARATOR')
+                      if t.kind=='ident' and t.text in ('by','without') and i+1<len(ts) and ts[i+1].text=='(':
+                          j=matching[i+1]
+                          for k in range(i+2,j):
+                              if ts[k].text==',':continue
+                              if ts[k].kind!='ident':raise Refuse('UNSUPPORTED','BAD_GROUPING')
+                              grouping[k]=t.text
+                  old_found=[(i,n) for i,n in all_metric_strings if n in METRIC_NAMES and i not in labels and i not in grouping]
+                  new_found=[(i,n) for i,n in all_metric_strings if n in NEW_NAMES and i not in labels and i not in grouping]
+                  if not old_found:
+                      return {'decision':'ALREADY_NEW' if new_found else 'UNSUPPORTED','reasons':['NO_LEGACY_METRIC'],'rewrite':None}
+                  if new_found:raise Refuse('PROVENANCE_REQUIRED','OLD_AND_NEW_REFERENCED')
+                  if any(n in BUCKET_NAMES for _,n in old_found):
+                      raise Refuse('REJECT_BUCKET_LAYOUT','BUCKET_VECTOR_LAYOUT_NOT_VERIFIED')
+                  if any(t.kind=='ident' and t.text=='histogram_quantile' for t in ts):
+                      raise Refuse('REJECT_BUCKET_LAYOUT','PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF')
+                  # All old metric identifier positions must be at valid selector locations.
+                  for i,n in old_found:
+                      if i>0 and ts[i-1].text in ('.',):
+                          raise Refuse('UNSUPPORTED','INVALID_METRIC_CONTEXT')
+                      if i+1<len(ts) and ts[i+1].text not in ('{','[',')',',','/','*','+','-','==','!=','>','<','>=','<='):
+                          raise Refuse('UNSUPPORTED','AMBIGUOUS_METRIC_CONTEXT')
+                      if i in labels or i in grouping:
+                          raise Refuse('UNSUPPORTED','METRIC_MISCLASSIFIED_AS_LABEL')
+                  # Reject other series even when their names do not appear in matcher braces.
+                  # This prevents accidentally renaming a shared label on an unrelated metric.
+                  for i,t in enumerate(ts):
+                      if t.kind=='ident' and t.text in ('rate','increase','max_over_time','min_over_time') and i+2<len(ts) and ts[i+1].text=='(': 
+                          if ts[i+2].kind!='ident' or ts[i+2].text not in METRIC_NAMES | NEW_NAMES:
+                              raise Refuse('UNSUPPORTED','OTHER_METRIC_IN_TEMPORAL_QUERY')
+                  # Need a clear window of temporal operators to reason about counters.
+                  if not any(t.kind=='ident' and t.text in ('rate','increase','max_over_time','min_over_time') for t in ts):
+                      raise Refuse('UNSUPPORTED','TEMPORAL_SEMANTICS_NOT_VALIDATED')
+                  # Grouping by HTTP method cannot retain fine-grained distinctions after collapse.
+                  if any(ts[i].text=='http_method' for i in grouping):
+                      raise Refuse('PROVEN_IMPOSSIBLE','GROUP_LABEL_COLLAPSE',
+                                    {'witness':{'old_a':'BREW','old_b':'PROPFIND','new_a':'_OTHER','new_b':'_OTHER'}})
+                  if any(ts[i].text in SENSITIVE for i in list(labels)+list(grouping)):
+                      raise Refuse('NEEDS_SEMANTIC_REVIEW','FIELD_SEMANTICS_OR_EMISSION_CHANGED')
+                  for i,(op,pattern) in labels.items():
+                      if ts[i].text=='http_method':
+                          w=fibre_witness(op,pattern)
+                          if w:raise Refuse('PROVEN_IMPOSSIBLE','METHOD_VALUE_COLLAPSE',{'witness':w})
+                  # Only known legacy metric identifiers and *label-key positions* may be edited.
+                  for i,n in old_found: edits.append((ts[i].start,ts[i].end,_metric_rename(n)))
+                  for i in list(labels)+list(grouping):
+                      if ts[i].text in MAPPING:
+                          edits.append((ts[i].start,ts[i].end,MAPPING[ts[i].text]))
+                  # All legacy _sum references must be immediately inside rate()/increase()
+                  # of a vector selector. Insert an explicit factor to preserve old ms units.
+                  n_scaled=0; covered_sum=set()
+                  for i,t in enumerate(ts):
+                      if t.kind!='ident' or t.text not in ('rate','increase') or i+1>=len(ts) or ts[i+1].text!='(':
+                          continue
+                      k=matching[i+1]
+                      sums=[j for j,n in old_found if n in SUM_NAMES and i+2<=j<k]
+                      if not sums:continue
+                      if len(sums)!=1 or ts[i+2].text not in SUM_NAMES or any(ts[x].text=='(' for x in range(i+2,k)):
+                          raise Refuse('UNSUPPORTED','COMPLEX_SUM_RATE_CONTEXT')
+                      j=sums[0]
+                      if j != i+2:raise Refuse('UNSUPPORTED','SUM_NOT_DIRECT_RATE_ARGUMENT')
+                      # Strict matrix selector: metric{matchers}?[range] inside rate/increase.
+                      after=j+1
+                      if after<k and ts[after].text=='{':after=matching[after]+1
+                      if after>=k or ts[after].text!='[' or matching[after]!=k-1:
+                          raise Refuse('UNSUPPORTED','SUM_WITHOUT_DIRECT_RANGE')
+                      edits.extend(((t.start,t.start,'(1000 * '),(ts[k].end,ts[k].end,')')))
+                      covered_sum.add(j);n_scaled+=1
+                  if any(j not in covered_sum for j,n in old_found if n in SUM_NAMES):
+                      raise Refuse('UNSUPPORTED','SUM_NOT_SCALED_SAFELY')
+                  # Unknown legacy symbols in label-key positions are not automatically renamed.
+                  if any(ts[i].text in SENSITIVE for i in labels):
+                      raise Refuse('NEEDS_SEMANTIC_REVIEW','FIELD_SEMANTICS_OR_EMISSION_CHANGED')
+                  # Verify edits are non-overlapping and no quote is targeted.
+                  for a,b,repl in edits:
+                      if any(not (b <= q.start or a >= q.end) for q in ts if q.kind=='string'):
+                          raise AssertionError('attempted to edit literal')
+                  for a,b,_ in sorted(edits):
+                      if a > b:raise AssertionError('negative span')
+                  edit_positions = set()
+                  for a,b,_ in edits:
+                      for z in range(a,b):
+                          if z in edit_positions:raise AssertionError('overlapping edit spans')
+                          edit_positions.add(z)
+                  result=query
+                  for a,b,repl in sorted(edits,key=lambda v:(v[0],v[1]),reverse=True):
+                      result=result[:a]+repl+result[b:]
+                  return {'decision':'CONDITIONAL_REWRITE',
+                          'reasons':['REQUIRES_EXPORTER_EQUIVALENCE','REQUIRES_EXCLUSIVE_EMISSION','REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS',
+                                     'METHOD_VALUE_FINITE_DOMAIN_ONLY'],
+                          'rewrite':result,'sum_rates_scaled':n_scaled,
+                          'edits':len(edits)}
+              except Refuse as exc:
+                  ret={'decision':exc.decision,'reasons':[exc.reason],'rewrite':None}
+                  if exc.detail:ret['detail']=exc.detail
+                  return ret
+          
+          
+          def histogram_alert_certificate(edges, cumulative, total, phi, threshold):
+              """Sharp determination of TRUE nearest-rank quantile exceeding a threshold.
+              Does NOT assert equivalence to PromQL histogram_quantile interpolation.
+              Edges/cumulative are finite exact counts of samples up to each edge.
+              """
+              if not len(edges)==len(cumulative) or not edges or any(not math.isfinite(x) for x in edges):
+                  raise ValueError('bad edges')
+              if any(edges[i]>=edges[i+1] for i in range(len(edges)-1)):
+                  raise ValueError('edges must increase')
+              if total<1 or int(total)!=total or any(int(x)!=x or x<0 for x in cumulative):
+                  raise ValueError('require positive integer count data')
+              if any(cumulative[i]>cumulative[i+1] for i in range(len(cumulative)-1)) or cumulative[-1]>total:
+                  raise ValueError('nonmonotone cumulative counts')
+              if not (0<phi<=1) or not math.isfinite(threshold):raise ValueError('invalid phi or threshold')
+              j=bisect.bisect_left(edges,threshold)
+              if j<len(edges) and edges[j]==threshold: lower=upper=cumulative[j]
+              else:
+                  lower=cumulative[j-1] if j else 0
+                  upper=cumulative[j] if j<len(edges) else total
+              rank=math.ceil(phi*total)
+              if upper<rank: status='GUARANTEED_FIRING'
+              elif lower>=rank: status='GUARANTEED_NOT_FIRING'
+              else:status='AMBIGUOUS'
+              return {'status':status,'min_events_le_threshold':lower,'max_events_le_threshold':upper,
+                      'rank':rank,'threshold':threshold,'scope':'true_nearest_rank_quantile_not_promql_interpolation',
+                      'counterexample_counts':{'world_low_le':lower,'world_high_le':upper} if status=='AMBIGUOUS' else None}
+          
+          
+          def evaluate_previous_corpus(path: Path) -> list[dict]:
+              original=json.loads(path.read_text(encoding='utf8'))
+              return [{'name':o['name'],'origin':o['origin'],'query':o['query'],'old_decision':o['result']['decision'],
+                       'new':migrate(o['query'])} for o in original]
+          
+          
+          def run_tests() -> dict:
+              good={};detail={}
+              audit_inputs=[
+                  ('team="http_method"','team="http_method"'),
+                  ('team="http_status_code"','team="http_status_code"'),
+                  ('team="http_server_duration_milliseconds_count"','team="http_server_duration_milliseconds_count"'),
+              ]
+              base='sum(rate('+OLD+'count{team="http_method",http_status_code="200"}[5m]))'
+              r=migrate(base)
+              good['original_literal_preserved']=(r['decision']=='CONDITIONAL_REWRITE' and 'team="http_method"' in r['rewrite'])
+              good['key_converted']=(r['decision']=='CONDITIONAL_REWRITE' and 'http_response_status_code="200"' in r['rewrite'])
+              for a,b in audit_inputs:
+                  q='sum(rate('+OLD+'count{'+a+'}[5m]))';got=migrate(q)
+                  good['regression_'+a]=(got['decision']=='CONDITIONAL_REWRITE' and b in got['rewrite'])
+              q='sum(rate('+OLD+'sum[5m])) / sum(rate('+OLD+'count[5m]))'
+              got=migrate(q)
+              good['sum_ms_factor']=(got['decision']=='CONDITIONAL_REWRITE' and got['sum_rates_scaled']==1 and '(1000 * rate('+NEW+'sum[5m]))' in got['rewrite'])
+              q='sum(increase('+OLDCLIENT+'sum{http_method="GET"}[10m]))'
+              got=migrate(q)
+              good['client_increase']=(got['decision']=='CONDITIONAL_REWRITE' and got['sum_rates_scaled']==1 and NEWCLIENT+'sum' in got['rewrite'])
+              q='sum(rate('+OLD+'count{http_method="PROPFIND"}[5m]))'
+              good['lossy_method_refused']=migrate(q)['decision']=='PROVEN_IMPOSSIBLE'
+              q='sum by(http_method)(rate('+OLD+'count[5m]))'
+              good['lossy_grouping_refused']=migrate(q)['decision']=='PROVEN_IMPOSSIBLE'
+              q='histogram_quantile(0.95,sum by(le)(rate('+OLD+'bucket[5m])))'
+              good['buckets_refused']=migrate(q)['decision']=='REJECT_BUCKET_LAYOUT'
+              good['mixed_refused']=migrate('sum(rate('+OLD+'count[5m]))+sum(rate('+NEW+'count[5m]))')['decision']=='PROVENANCE_REQUIRED'
+              good['unsupported_binary_refused']=migrate('sum(rate('+OLD+'count[5m])) on(job) foo')['decision']=='UNSUPPORTED'
+              good['unbalanced_refused']=migrate('sum(rate('+OLD+'count[5m])')['decision']=='UNSUPPORTED'
+              good['no_string_as_metric']=migrate('sum(rate(other_counter{team="'+OLD+'count"}[5m]))')['decision']=='UNSUPPORTED'
+              good['other_metric_guard']=migrate('sum(rate('+OLD+'count[5m]))+sum(rate(unrelated_metric{http_status_code="200"}[5m]))')['decision']=='UNSUPPORTED'
+              good['other_metric_no_labels_guard']=migrate('sum(rate('+OLD+'count[5m]))+sum(rate(unrelated_metric[5m]))')['decision']=='UNSUPPORTED'
+              good['hist_true_quantile_high']=histogram_alert_certificate([.2,.6],[1,5],10,.9,.2)['status']=='GUARANTEED_FIRING'
+              good['hist_true_quantile_low']=histogram_alert_certificate([.2,.6],[8,10],10,.9,.6)['status']=='GUARANTEED_NOT_FIRING'
+              good['hist_ambiguous']=histogram_alert_certificate([.2,.8],[2,8],10,.5,.5)['status']=='AMBIGUOUS'
+              good['hist_exact_edge']=histogram_alert_certificate([.2,.8],[2,8],10,.5,.8)['status']=='GUARANTEED_NOT_FIRING'
+              rng=random.Random(719)
+              # Adversarial string content fuzz; derived from independent recorded audit bug.
+              for i in range(2000):
+                  v=''.join(rng.choice('abcdefghijklmnopqrstuvwxyz_0123456789') for _ in range(rng.randint(0,35)))
+                  v=v.replace('http_', 'http_')
+                  if i%3==0:v+=OLD+'count'
+                  if i%7==0:v+='http_method'
+                  if i%11==0:v+='http_status_code'
+                  v=v.replace('\\','').replace('"','')
+                  q='sum(rate('+OLD+'count{team="'+v+'",http_method="GET"}[5m]))'
+                  r=migrate(q)
+                  if r['decision']!='CONDITIONAL_REWRITE' or 'team="'+v+'"' not in r['rewrite']:
+                      good['literal_property_2000']=False;detail['literal_failure']=q;break
+              else:good['literal_property_2000']=True
+              # Numeric proof-oracle: generate exact individual events and check that
+              # 'GUARANTEED' claims match every generated event stream.
+              ncheck=0
+              for i in range(5000):
+                  edges=sorted(set(rng.sample(range(1,900),rng.randint(2,8))))
+                  values=[rng.randint(0,1000) for _ in range(rng.randint(2,90))]
+                  cum=[sum(x<=e for x in values) for e in edges]
+                  phi=rng.choice([.5,.9,.95,.99,1.0]); T=rng.randint(0,1000)
+                  cert=histogram_alert_certificate(edges,cum,len(values),phi,T)
+                  k=math.ceil(phi*len(values));true=sorted(values)[k-1]>T
+                  if (cert['status']=='GUARANTEED_FIRING' and not true) or (cert['status']=='GUARANTEED_NOT_FIRING' and true):
+                      good['histogram_sound_5000']=False;detail['hist_failure']={'edges':edges,'counts':cum,'phi':phi,'t':T,'n':len(values)};break
+                  ncheck+=1
+              else: good['histogram_sound_5000']=True
+              return {'assertions':good,'pass':sum(good.values()),'total':len(good),'numeric_oracle_cases':ncheck,
+                      'literal_property_cases':2000,'details':detail,'status':'PASS' if all(good.values()) else 'FAIL'}
+          
+          
+          def produce(results:Path, prior_corpus:Path, with_parser: bool=False):
+              results.mkdir(parents=True, exist_ok=True)
+              d=evaluate_previous_corpus(prior_corpus)
+              t=run_tests()
+              (results/'decisions_gate02.json').write_text(json.dumps(d,indent=2),encoding='utf8')
+              (results/'selftests_gate02.json').write_text(json.dumps(t,indent=2),encoding='utf8')
+              external=[r for r in d if r['origin']=='published_expression']
+              # For external parse validation, Grafana interpolation macros are placeholders
+              # and must be substituted transparently before calling an independent parser.
+              ast_result={'status':'NOT_RUN','reason':'independent parser not installed'}
+              if with_parser:
+                  try:
+                      import promql_parser
+                      checks=[]
+                      for r in d:
+                          before=r['query'].replace('$__rate_interval','5m')
+                          after=(r['new']['rewrite'] or r['query']).replace('$__rate_interval','5m')
+                          try:
+                              promql_parser.parse(before)
+                              promql_parser.parse(after)
+                              literal_equal=([t.text for t in lex(before) if t.kind=='string']==[t.text for t in lex(after) if t.kind=='string'])
+                              checks.append({'name':r['name'],'before':'PASS','after':'PASS',
+                                             'literals_identical':literal_equal,'status':'PASS' if literal_equal else 'FAIL'})
+                          except Exception as exc:
+                              checks.append({'name':r['name'],'before':'UNVERIFIED','after':'UNVERIFIED','status':'FAIL', 'error':str(exc)[:300]})
+                      ast_result={'status':'PASS' if all(x['status']=='PASS' for x in checks) else 'FAIL',
+                                  'note':'Grafana $__rate_interval substituted with 5m; this validates parsing, not equivalence',
+                                  'tested':len(checks),'checks':checks}
+                  except ImportError:ast_result={'status':'DEPENDENCY_MISSING'}
+              (results/'independent_parser.json').write_text(json.dumps(ast_result,indent=2),encoding='utf8')
+              summary={'project':'QSEM','gate':'02_harden_and_certificate','baseline_gate01_retained':True,
+                       'published_examples':len(external),'decisions_published':dict(collections.Counter(r['new']['decision'] for r in external)),
+                       'selftests':t['status'],'passed':t['pass'],'total':t['total'],
+                       'literal_bug_fixed':t['assertions']['original_literal_preserved'],
+                       'independent_parser':ast_result['status'],'novelty':'NOT_ESTABLISHED',
+                       'limitations':['conservative lexer+selector-context rewrite, not full PromQL AST',
+                                      'optional third-party PromQL parser validates syntax only',
+                                      'source examples curated; no real raw time-series',
+                                      'histogram certificate concerns true nearest-rank quantiles, NOT PromQL histogram_quantile interpolation',
+                                      'method fibres cover a finite pilot universe only',
+                                      'no claims of baseline performance or journal-grade originality']}
+              (results/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf8')
+              print(json.dumps({'selftests':t['status'],'passed':t['pass'],'total':t['total'],
+                                'published':len(external),'decisions':summary['decisions_published'],
+                                'independent_parser':ast_result['status']},ensure_ascii=False))
+              return 0 if t['status']=='PASS' and (not with_parser or ast_result['status']=='PASS') else 2
+          
+          if __name__=='__main__':
+              import argparse
+              ap=argparse.ArgumentParser()
+              ap.add_argument('--corpus',required=True)
+              ap.add_argument('--out',required=True)
+              ap.add_argument('--with-parser',action='store_true')
+              args=ap.parse_args()
+              sys.exit(produce(Path(args.out),Path(args.corpus),args.with_parser))
+          QSEM_CORE_02
+          cat > gate01_decisions.json <<'QSEM_CORPUS_02'
+          [
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.5",
+              "query": "histogram_quantile(0.5, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.75",
+              "query": "histogram_quantile(0.75, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.9",
+              "query": "histogram_quantile(0.9, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.95",
+              "query": "histogram_quantile(0.95, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.98",
+              "query": "histogram_quantile(0.98, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.99",
+              "query": "histogram_quantile(0.99, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_histogram_quantile_0.999",
+              "query": "histogram_quantile(0.999, sum by(le) (rate(http_server_duration_milliseconds_bucket{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\"}[5m])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_error_4xx5xx",
+              "query": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_status_code=~\"4..|5..\"}[5m]))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum(rate(http_server_request_duration_seconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_response_status_code=~\"4..|5..\"}[5m]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_error_4xx",
+              "query": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_status_code=~\"4..\"}[5m]))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum(rate(http_server_request_duration_seconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_response_status_code=~\"4..\"}[5m]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_error_5xx",
+              "query": "sum(rate(http_server_duration_milliseconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_status_code=~\"5..\"}[5m]))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum(rate(http_server_request_duration_seconds_count{exported_job=\"$exported_job\", exported_instance=\"$exported_instance\", http_response_status_code=~\"5..\"}[5m]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "source": "https://github.com/isaacOjeda/DevToPosts/blob/main/OpenTelemetryExample/resources/grafana-dashboard-02.json",
+              "name": "dashboard_request_max",
+              "query": "sum by (scheme) (max_over_time(http_server_duration_milliseconds_count{exported_job=\"$exported_job\",exported_instance=\"$exported_instance\"}[$__rate_interval]))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum by (scheme) (max_over_time(http_server_request_duration_seconds_count{exported_job=\"$exported_job\",exported_instance=\"$exported_instance\"}[$__rate_interval]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "source": "https://github.com/PacktPublishing/Observability-with-Grafana",
+              "name": "packt_p95",
+              "query": "histogram_quantile(0.95, sum(rate(http_server_duration_milliseconds_bucket{}[$__rate_interval])) by (le))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "PERCENTILE_REQUIRES_BUCKET_EQUIVALENCE_PROOF"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/open-telemetry/opentelemetry-python-contrib/issues/3011",
+              "name": "real_issue_old_bucket_rate",
+              "query": "sum(rate(http_server_duration_milliseconds_bucket{app=\"x\", environment=\"dev\"}[$__rate_interval])) by (le)",
+              "origin": "published_expression",
+              "result": {
+                "decision": "REJECT_BUCKET_LAYOUT",
+                "reasons": [
+                  "BUCKET_VECTOR_LAYOUT_NOT_VERIFIED"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://github.com/open-telemetry/opentelemetry-python-contrib/issues/3011",
+              "name": "real_issue_new_bucket_rate",
+              "query": "sum(rate(http_server_request_duration_seconds_bucket{app=\"x\", environment=\"dev\"}[$__rate_interval])) by (le)",
+              "origin": "published_expression",
+              "result": {
+                "decision": "ALREADY_NEW",
+                "reasons": [
+                  "NO_LEGACY_METRIC"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "source": "https://grafana.com/blog/opentelemetry-with-prometheus-better-integration-through-resource-attribute-promotion/",
+              "name": "grafana_recent_p95",
+              "query": "histogram_quantile(0.95, sum by(le, deployment_environment_name, service_namespace, service_name) (rate(http_server_request_duration_seconds_bucket{deployment_environment_name=~\"$deployment_environment_name\", service_namespace=~\"$service_namespace\", service_name=\"$service_name\"}[$__rate_interval])))",
+              "origin": "published_expression",
+              "result": {
+                "decision": "ALREADY_NEW",
+                "reasons": [
+                  "NO_LEGACY_METRIC"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "standard_method",
+              "query": "sum(rate(http_server_duration_milliseconds_count{http_method=\"GET\"}[5m]))",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum(rate(http_server_request_duration_seconds_count{http_request_method=\"GET\"}[5m]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "collapsed_method",
+              "query": "sum(rate(http_server_duration_milliseconds_count{http_method=\"PROPFIND\"}[5m]))",
+              "result": {
+                "decision": "PROVEN_IMPOSSIBLE",
+                "reasons": [
+                  "METHOD_VALUE_COLLAPSE"
+                ],
+                "detail": {
+                  "witness": {
+                    "old_a": "BREW",
+                    "old_b": "PROPFIND",
+                    "new_a": "_OTHER",
+                    "new_b": "_OTHER",
+                    "predicate_a": false,
+                    "predicate_b": true
+                  }
+                },
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "other_method",
+              "query": "sum(rate(http_server_duration_milliseconds_count{http_method=\"_OTHER\"}[5m]))",
+              "result": {
+                "decision": "PROVEN_IMPOSSIBLE",
+                "reasons": [
+                  "METHOD_VALUE_COLLAPSE"
+                ],
+                "detail": {
+                  "witness": {
+                    "old_a": "BREW",
+                    "old_b": "_OTHER",
+                    "new_a": "_OTHER",
+                    "new_b": "_OTHER",
+                    "predicate_a": false,
+                    "predicate_b": true
+                  }
+                },
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "method_regex",
+              "query": "sum(rate(http_server_duration_milliseconds_count{http_method=~\"GET|POST\"}[5m]))",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum(rate(http_server_request_duration_seconds_count{http_request_method=~\"GET|POST\"}[5m]))",
+                "sum_rates_scaled": 0
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "method_negation",
+              "query": "sum(rate(http_server_duration_milliseconds_count{http_method!=\"PROPFIND\"}[5m]))",
+              "result": {
+                "decision": "PROVEN_IMPOSSIBLE",
+                "reasons": [
+                  "METHOD_VALUE_COLLAPSE"
+                ],
+                "detail": {
+                  "witness": {
+                    "old_a": "BREW",
+                    "old_b": "PROPFIND",
+                    "new_a": "_OTHER",
+                    "new_b": "_OTHER",
+                    "predicate_a": true,
+                    "predicate_b": false
+                  }
+                },
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "grouped_by_method",
+              "query": "sum by (http_method) (rate(http_server_duration_milliseconds_count[5m]))",
+              "result": {
+                "decision": "PROVEN_IMPOSSIBLE",
+                "reasons": [
+                  "GROUP_LABEL_COLLAPSE"
+                ],
+                "detail": {
+                  "witness": {
+                    "old_a": "BREW",
+                    "old_b": "PROPFIND",
+                    "new_a": "_OTHER",
+                    "new_b": "_OTHER"
+                  }
+                },
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "milliseconds_sum",
+              "query": "sum(rate(http_server_duration_milliseconds_sum{http_status_code=\"200\"}[5m]))",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum((1000 * rate(http_server_request_duration_seconds_sum{http_response_status_code=\"200\"}[5m])))",
+                "sum_rates_scaled": 1
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "average_duration",
+              "query": "sum(rate(http_server_duration_milliseconds_sum[5m])) / sum(rate(http_server_duration_milliseconds_count[5m]))",
+              "result": {
+                "decision": "CONDITIONAL_REWRITE",
+                "reasons": [
+                  "REQUIRES_EXPORTER_EQUIVALENCE",
+                  "REQUIRES_EXCLUSIVE_EMISSION",
+                  "REQUIRES_SAME_EVENTS_AND_LABEL_COMPLETENESS"
+                ],
+                "rewrite": "sum((1000 * rate(http_server_request_duration_seconds_sum[5m]))) / sum(rate(http_server_request_duration_seconds_count[5m]))",
+                "sum_rates_scaled": 1
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "host_changed",
+              "query": "sum(rate(http_server_duration_milliseconds_count{net_host_name=\"foo\"}[5m]))",
+              "result": {
+                "decision": "NEEDS_SEMANTIC_REVIEW",
+                "reasons": [
+                  "FIELD_SEMANTICS_OR_EMISSION_CHANGED"
+                ],
+                "rewrite": null
+              }
+            },
+            {
+              "origin": "constructed_probe",
+              "source": null,
+              "name": "new_already",
+              "query": "sum(rate(http_server_request_duration_seconds_count[5m]))",
+              "result": {
+                "decision": "ALREADY_NEW",
+                "reasons": [
+                  "NO_LEGACY_METRIC"
+                ],
+                "rewrite": null
+              }
+            }
+          ]
+          QSEM_CORPUS_02
+          python -m py_compile qsem_core.py
+      - name: Install independent PromQL parser
+        shell: bash
+        run: |
+          set -eu
+          python -m pip install --disable-pip-version-check --quiet 'promql-parser==0.11.0' > QSEM_Gate02_Results/dependency_log.txt 2>&1
+          python -c "import promql_parser; print('PROMQL_PARSER_READY')"
+      - name: Gate02 regression, histogram certificates, and PromQL parsing
+        shell: bash
+        run: |
+          set -eu
+          python qsem_core.py --corpus gate01_decisions.json --out QSEM_Gate02_Results --with-parser
+      - name: Independently assess certificates on real monitoring observations
+        shell: bash
+        run: |
+          set -eu
+          cat > qsem_real_latency.py <<'QSEM_REAL_LATENCY_02'
+          #!/usr/bin/env python3
+          """Independent numeric certificate check against actual monitoring observations.
+          
+          Source: Stefan Sepin's edge-fault-dataset (TU Wien, 2026), CC BY-SA 4.0.
+          Read-only external CSV; no re-release of original CSV in result artifact.
+          These are 1-second scrape observations, NOT an actual dual-OTel migration pair.
+          Two bucket schemes are deliberately constructed stress-test layouts, not claimed
+          instrumentation defaults. The certificate is for true nearest-rank quantiles only.
+          """
+          from __future__ import annotations
+          import argparse
+          import collections
+          import csv
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          import subprocess
+          from pathlib import Path
+          import urllib.request
+          from qsem_core import histogram_alert_certificate
+          
+          DEFAULT_URL='https://raw.githubusercontent.com/ssepin/edge-fault-dataset/main/edge_fault_dataset.csv'
+          EDGES={
+              'layout_a_constructed': [.05,.1,.25,.5,1.0,2.0,5.0],
+              'layout_b_constructed': [.075,.15,.3,.6,1.2,2.4,4.8],
+          }
+          THRESHOLDS=[.1,.25,.5,1.0,2.0]
+          PHIS=[.9,.95,.99]
+          
+          
+          def run(out:Path, csv_path:Path|None=None, source_url=DEFAULT_URL, min_rows=1000, min_groups=2):
+              out.mkdir(exist_ok=True,parents=True)
+              source_commit=None
+              if csv_path:
+                  raw=csv_path.read_bytes();source=str(csv_path)
+              else:
+                  remote='https://github.com/ssepin/edge-fault-dataset.git'
+                  listing=subprocess.check_output(['git','ls-remote',remote,'refs/heads/main'],timeout=35,text=True).strip()
+                  source_commit=listing.split()[0] if listing else None
+                  if not source_commit or not re.fullmatch(r'[0-9a-f]{40}',source_commit):
+                      raise ValueError('cannot freeze external source commit')
+                  source_url=f'https://raw.githubusercontent.com/ssepin/edge-fault-dataset/{source_commit}/edge_fault_dataset.csv'
+                  req=urllib.request.Request(source_url,headers={'User-Agent':'QSEM-independent-metrics-audit','Accept':'text/csv'})
+                  with urllib.request.urlopen(req,timeout=50) as resp:
+                      raw=resp.read(12_000_000)
+                  if not 100_000<len(raw)<12_000_000:
+                      raise ValueError('unexpected downloaded CSV size')
+                  source=source_url
+              text=raw.decode('utf-8-sig',errors='strict')
+              reader=csv.DictReader(io.StringIO(text))
+              required={'response_time','application','device','fault_type'}
+              if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                  raise ValueError('unexpected CSV schema '+repr(reader.fieldnames))
+              groups=collections.defaultdict(list); inspected=0;filtered=0
+              for r in reader:
+                  inspected+=1
+                  if 'curl_exit_code' in r and str(r['curl_exit_code']).strip() not in ('0','0.0'):
+                      filtered+=1;continue
+                  try:v=float(r['response_time'])
+                  except (TypeError,ValueError):filtered+=1;continue
+                  if not math.isfinite(v) or v<0:filtered+=1;continue
+                  key=tuple((r.get(x) or '<NA>').strip() for x in ('application','device','fault_type'))
+                  groups[key].append(v)
+              groups={k:values for k,values in groups.items() if len(values)>=30}
+              usable=sum(map(len,groups.values()))
+              if usable<min_rows or len(groups)<min_groups:
+                  raise ValueError(f'data sufficiency not met: usable={usable},groups={len(groups)}')
+              checks=0;certified=0;ambiguous=0;false_certificates=0;case_results=[]
+              stats=collections.Counter();by_mode=collections.defaultdict(collections.Counter)
+              for key,values in sorted(groups.items()):
+                  observed=sorted(values)
+                  n=len(observed)
+                  for scheme_name,edges in EDGES.items():
+                      cum=[sum(v<=e for v in observed) for e in edges]
+                      for phi in PHIS:
+                          kth=observed[math.ceil(phi*n)-1]
+                          threshold_groups=[('fixed_prespecified',THRESHOLDS),
+                                            ('adaptive_stress_only',[0.8*kth,kth,1.2*kth])]
+                          for mode_name,threshold_list in threshold_groups:
+                            for threshold in threshold_list:
+                              truth=(kth>threshold)
+                              cert=histogram_alert_certificate(edges,cum,n,phi,threshold)
+                              predicted={'GUARANTEED_FIRING':True,'GUARANTEED_NOT_FIRING':False}.get(cert['status'])
+                              wrong=predicted is not None and predicted!=truth
+                              false_certificates+=int(wrong)
+                              certified+=int(predicted is not None)
+                              ambiguous+=int(predicted is None)
+                              checks+=1;stats[cert['status']]+=1
+                              by_mode[mode_name]['total']+=1
+                              by_mode[mode_name]['certified']+=int(predicted is not None)
+                              by_mode[mode_name]['ambiguous']+=int(predicted is None)
+                              by_mode[mode_name]['false_certificates']+=int(wrong)
+                              if len(case_results)<90:
+                                  case_results.append({'group':key,'layout':scheme_name,'phi':phi,'threshold_mode':mode_name,'threshold_s':threshold,
+                                                       'actual_gt_threshold':truth,'certificate':cert['status'],
+                                                       'rank':cert['rank'],'interval_count_le_threshold':[
+                                                          cert['min_events_le_threshold'],cert['max_events_le_threshold']]})
+              report={'source':source,'source_commit':source_commit,'source_sha256':hashlib.sha256(raw).hexdigest(),'source_license':'CC BY-SA 4.0',
+                      'input_bytes':len(raw),'rows_inspected':inspected,'filtered_rows':filtered,
+                      'groups_of_30_or_more':len(groups),'usable_observations':usable,
+                      'unit':'response_time seconds','bucket_layouts':'constructed; NOT exporter defaults',
+                      'true_event_quantile':'nearest-rank; NOT PromQL histogram_quantile',
+                      'checked_group_layout_phi_threshold_cases':checks,
+                      'certified':certified,'ambiguous':ambiguous,'false_certificates':false_certificates,
+                      'status_counts':dict(stats),'by_threshold_mode':{k:dict(v) for k,v in by_mode.items()},'status':'PASS' if false_certificates==0 else 'FAIL',
+                      'sample_cases_first_90':case_results,
+                      'limitations':['one-second scrape values are treated as observations; they are not OTLP histogram events',
+                                     'source does not contain paired old/new schema emissions',
+                                     'synthetic histogram bucket layouts on real-valued independent observations',
+                                     'quantile bounds are existing mathematics; algorithmic originality not proven']}
+              (out/'external_latency_certificate.json').write_text(json.dumps(report,indent=2),encoding='utf8')
+              print(json.dumps({k:report[k] for k in ['rows_inspected','usable_observations','groups_of_30_or_more',
+                       'checked_group_layout_phi_threshold_cases','certified','ambiguous','false_certificates','status']}))
+              return 0 if false_certificates==0 else 2
+          
+          if __name__=='__main__':
+              p=argparse.ArgumentParser()
+              p.add_argument('--out',required=True);p.add_argument('--csv')
+              p.add_argument('--min-rows',type=int,default=1000)
+              p.add_argument('--min-groups',type=int,default=2)
+              args=p.parse_args()
+              raise SystemExit(run(Path(args.out),Path(args.csv) if args.csv else None,
+                                  min_rows=args.min_rows,min_groups=args.min_groups))
+          QSEM_REAL_LATENCY_02
+          python -m py_compile qsem_real_latency.py
+          python qsem_real_latency.py --out QSEM_Gate02_Results > QSEM_Gate02_Results/real_data_log.txt 2>&1 || { cat QSEM_Gate02_Results/real_data_log.txt; exit 1; }
+          cat QSEM_Gate02_Results/real_data_log.txt
+      - name: Preserve run diagnostics even if a check fails
+        if: always()
+        shell: bash
+        run: |
+          python - <<'QSEM_RESULT_BUNDLE'
+          import json, os, pathlib, zipfile
+          p=pathlib.Path('QSEM_Gate02_Results');p.mkdir(exist_ok=True)
+          if not (p/'summary.json').exists():
+              (p/'setup_status.json').write_text(json.dumps({'status':'GATE_INCOMPLETE','reason':'Check job logs and dependency_log.txt'}))
+          z=p/'QSEM_Gate02_Results.zip'
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED) as out:
+              for f in sorted(p.iterdir()):
+                  if f.is_file() and f!=z:out.write(f,f.name)
+          print('RESULT_ZIP_BYTES',z.stat().st_size)
+          QSEM_RESULT_BUNDLE
+      - name: Upload the single combined artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSEM_Gate02_Results
+          path: QSEM_Gate02_Results/QSEM_Gate02_Results.zip
+          if-no-files-found: error
+          retention-days: 14
