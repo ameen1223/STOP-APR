@@ -1,0 +1,1088 @@
+name: QSEM Final Independent Referee Audit
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  referee:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install tested analysis dependencies
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python -m pip install --disable-pip-version-check --no-cache-dir 'scipy==1.17.0' 'PyYAML==6.0.3' 2>&1 | tee out/pip_install.log
+          python -m pip check | tee out/pip_check.log
+          python - <<'PY'
+          import scipy,yaml,json
+          assert scipy.__version__ == '1.17.0'
+          assert yaml.__version__ == '6.0.3'
+          print('PINNED_ANALYSIS_DEPENDENCIES_PASS')
+          PY
+      - name: Restore exact pinned Q-SEM sources and frozen Gate03 evidence
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > rounding_certificate.py <<'PY_QSEM_0'
+          #!/usr/bin/env python3
+          """Q-SEM exact restricted certificates for legacy integer-ms HTTP duration histograms.
+          
+          Scope:
+            - Legacy old observations: Python round(t_seconds*1000), clamped at 0.
+            - All t >= 0, no NaNs; bucket boundaries in integral milliseconds.
+            - Old histogram count, cumulative counts, and integer rounded _sum known.
+            - New histogram records full precision seconds and uses positive old boundaries
+              converted from milliseconds, omitting the old zero boundary.
+            - Prometheus *classic histogram* quantile, no native histograms, no resets,
+              label changes, server-side reaggregation, scrape gaps or rate extrapolation.
+          
+          For a threshold between target bucket edges b_i and b_{i+1}, only the number of
+          legacy observations exactly rounded to these two edges that cross to the next
+          bucket changes the linearly interpolated CDF at that threshold. A global
+          integer-sum budget constrains their maximal number. Thus a two-variable
+          bounded knapsack, solved exactly by residue arithmetic, suffices for a sound
+          fixed-threshold alert certificate without reconstructing all observations.
+          
+          This is a research prototype, NOT a complete PromQL translation/certifier.
+          """
+          from __future__ import annotations
+          from dataclasses import dataclass
+          from fractions import Fraction
+          from math import gcd
+          from typing import Optional
+          import json
+          
+          
+          def fq(v):
+              if isinstance(v, Fraction):return v
+              return Fraction(str(v))
+          
+          
+          def _pair_opt(costs, caps, weights, budget):
+              """Max w_i*z_i for <=2 bounded integer items; period-class exact search.
+          
+              Costs/weights/caps are nonnegative. Residue classes cut a constant-slope
+              objective between saturation points of the other item, so endpoint checks
+              suffice. Complexity O(min(c1,c2)/gcd(c1,c2)) in 2-item case independent of
+              the number of observations.
+              """
+              if not costs:return Fraction(0), []
+              assert all(isinstance(c,int) and c>=0 for c in costs)
+              assert all(isinstance(n,int) and n>=0 for n in caps)
+              assert budget>=0 and len(costs)==len(weights)==len(caps) and len(costs)<=2
+              if len(costs)==1:
+                  c=costs[0];n=caps[0]
+                  x=n if c==0 else min(n,budget//c)
+                  return weights[0]*x,[x]
+              a,b=costs;A,B=caps;wa,wb=weights
+              if a==0 or b==0:
+                  if a==0:
+                      z0=A;z1=B if b==0 else min(B,budget//b)
+                  else:
+                      z1=B;z0=min(A,budget//a)
+                  return wa*z0+wb*z1,[z0,z1]
+              swap = a<b  # enumerate larger-cost item, with smaller-cost residue period
+              if swap: a,b=b,a;A,B=B,A;wa,wb=wb,wa
+              xmax=min(A,budget//a)
+              P=b//gcd(a,b)
+              border=(budget-b*B)//a # x at or below this implies y saturated
+              best_val=Fraction(-1);best=None
+              for r in range(min(xmax+1,P)):
+                  kmax=(xmax-r)//P
+                  def last_le(bound):
+                      k=min(kmax,(bound-r)//P)
+                      if k>=0:return r+k*P
+                      return None
+                  opts=[r,r+kmax*P]
+                  cap=last_le(border)
+                  if cap is not None:
+                      opts.append(cap)
+                      if cap+P<=xmax: opts.append(cap+P)
+                  else:
+                      opts.append(r)
+                  for x in set(opts):
+                      if x<0 or x>xmax:continue
+                      y=min(B,(budget-a*x)//b)
+                      val=wa*x+wb*y
+                      if val>best_val or (val==best_val and (best is None or (x,y)<best)):
+                          best_val=val;best=(x,y)
+              assert best is not None
+              xs=list(best[::-1] if swap else best)
+              return best_val,xs
+          
+          
+          @dataclass(frozen=True)
+          class OldHistogram:
+              bounds_ms:tuple[int,...]  # includes zero; excludes +Inf
+              cumulative:tuple[int,...]
+              count:int
+              sum_rounded_ms:int
+          
+              def validate(self):
+                  b=self.bounds_ms;c=self.cumulative
+                  if not (len(b)>=3 and len(b)==len(c) and b[0]==0 and
+                      all(x>=0 for x in b) and all(x<y for x,y in zip(b,b[1:])) and
+                      all(isinstance(x,int) for x in b+c+(self.count,self.sum_rounded_ms)) and
+                      all(0<=x<=y for x,y in zip((0,)+c,c+(self.count,))) and
+                      self.sum_rounded_ms>=0):
+                      raise ValueError('INVALID_HISTOGRAM')
+                  ns=[c[0]]+[c[i]-c[i-1] for i in range(1,len(c))]+[self.count-c[-1]]
+                  lo=[0]+[b[i-1]+1 for i in range(1,len(b))]+[b[-1]+1]
+                  base=sum(n*k for n,k in zip(ns,lo))
+                  maxsum=sum(n*upper for n,upper in zip(ns[:-1],b))
+                  if self.sum_rounded_ms < base or (not ns[-1] and self.sum_rounded_ms>maxsum):
+                      raise ValueError('OLD_SUM_INCONSISTENT_WITH_BUCKETS')
+                  return ns,lo,base
+          
+          
+          def _new_q(phi, bound_ms, new_cumulative, count):
+              """Analytical classic Prom histogram quantile (supported nonnegative subset)."""
+              r=fq(phi)*count
+              prev_count=0;prev_bound=0
+              for b,c in zip(bound_ms,new_cumulative):
+                  if r<=c:
+                      if c<=prev_count:return fq(b)
+                      return fq(prev_bound)+fq(b-prev_bound)*(r-prev_count)/(c-prev_count)
+                  prev_count=c;prev_bound=b
+              return Fraction(bound_ms[-1]) # +Inf bucket -> second-highest finite edge
+          
+          
+          def certify(old:OldHistogram,phi,threshold_ms):
+              ns,lo,minsum=old.validate()
+              p=fq(phi);T=fq(threshold_ms)
+              if not (0<p<1):raise ValueError('PHI_OUTSIDE_RESTRICTED_RANGE')
+              if old.count==0:return {'status':'UNSUPPORTED','reason':'EMPTY_HISTOGRAM'}
+              b=old.bounds_ms[1:];cum=old.cumulative[1:]
+              if T<0:return {'status':'CERTIFIED_FIRE','reason':'NONNEGATIVE_DURATION'}
+              if T>=b[-1]:return {'status':'CERTIFIED_CLEAR','reason':'PROMETHEUS_FINITE_TOP_BUCKET'}
+              right=next(i for i,x in enumerate(b) if T<=x)
+              if right==0:
+                  left_bound=0;left_cum=0
+                  active=[right+1] # old index 1 is first positive bound
+                  weights=[T/b[0]] # wrong: weight at first bound is alpha=T/b; use fraction below
+                  weights=[T/fq(b[0])]
+                  nominal=weights[0]*cum[0]
+              else:
+                  low=b[right-1];high=b[right]
+                  alpha=(T-low)/fq(high-low)
+                  nominal=(1-alpha)*cum[right-1]+alpha*cum[right]
+                  active=[right,right+1] # indexes in legacy histogram
+                  weights=[1-alpha,alpha]
+              # Counts exactly on right legacy edge can move into next target bin;
+              # their minimum cost relative to leftmost rounded ms in that old bin.
+              costs=[old.bounds_ms[i]-lo[i] for i in active]
+              caps=[ns[i] for i in active]
+              budget=old.sum_rounded_ms-minsum
+              maxloss,chosen=_pair_opt(costs,caps,weights,budget)
+              worst=nominal-maxloss
+              rank=p*old.count
+              if nominal<rank: status='CERTIFIED_FIRE'
+              elif worst>=rank: status='CERTIFIED_CLEAR'
+              else: status='UNDECIDABLE'
+              return {'status':status,'threshold_ms':str(T),'phi':str(p),
+                      'count':old.count,'rank':str(rank),'nominal_interpolated_cdf':str(nominal),
+                      'minimal_interpolated_cdf':str(worst),'max_weighted_loss':str(maxloss),
+                      'sum_budget_over_bucket_minima':budget,
+                      'active_old_bounds_ms':[old.bounds_ms[i] for i in active],
+                      'max_loss_moved_counts':chosen,
+                      'model':'NONNEGATIVE_PYTHON_INTEGER_MS_ROUND_TO_FULL_PRECISION_SECONDS;CLASSIC_HISTOGRAM;STATIC_EXACT_COUNTS',
+                      'proof':'quantile_gt_threshold iff linearly-interpolated-CDF_at_threshold < phi*N; old bucket boundary k may migrate only when unrounded t>k; rounded integer sum limits boundary mass'}
+          
+          
+          def old_from_ms(values, bounds=(0,5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000)):
+              vals=[round(v) for v in values]
+              assert all(v>=0 and isinstance(v,int) for v in vals)
+              return OldHistogram(tuple(bounds),tuple(sum(k<=e for k in vals) for e in bounds),len(vals),sum(vals))
+          
+          
+          def target_from_events_ms(events,bounds):
+              positives=bounds[1:]
+              return [sum(v<=e for v in events) for e in positives]
+          
+          
+          def run_samples():
+              b=(0,5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000)
+              examples=[]
+              for name,events,threshold in [
+                  ('identical_4p6',[4.6]*100,7),
+                  ('identical_5p4',[5.4]*100,7),
+                  ('identical_1p2',[1.2]*100,7),
+                  ('identical_4p0',[4.0]*100,7),
+                  ('identical_0p0',[0.0]*100,7),
+                  ('mixed_low',[1.2]*96+[4.9]*4,7),
+              ]:
+                  old=old_from_ms(events,b)
+                  cert=certify(old,Fraction(95,100),threshold)
+                  newer=target_from_events_ms(events,b)
+                  quantile=_new_q(Fraction(95,100),b[1:],newer,len(events))
+                  actual=quantile>threshold
+                  predicts={'CERTIFIED_FIRE':True,'CERTIFIED_CLEAR':False}.get(cert['status'])
+                  if predicts is not None: assert predicts==actual,(name,cert,float(quantile))
+                  examples.append({'case':name,'new_p95_ms':str(quantile),'alert':actual,
+                                   'certificate':cert['status'],'max_loss_moved_counts':cert.get('max_loss_moved_counts')})
+              return examples
+          
+          if __name__=='__main__':
+              print(json.dumps(run_samples(),indent=2))
+          PY_QSEM_0
+          cat > active_bucket_certificate.py <<'PY_QSEM_1'
+          """Exact 0/1/2 new-bucket counter sufficiency under static ideal histogram model.
+          
+          Proof sketch: at fixed T, alert iff w1*z1+w2*z2 > gamma. The feasible
+          (z1,z2) are EXACTLY the box intersected with a single integer-sum knapsack.
+          No new counter needed if gamma outside that loss interval; if ambiguous,
+          querying z1 alone is sufficient iff there is no feasible pair with
+          w1*z1 <= gamma < w1*z1+w2*z2. This is checked by optimizing with z1's cap
+          reduced to floor(gamma/w1), using the original exact 2-item optimizer.
+          Equivalent test for querying z2. Two adjacent new cumulative counts always
+          suffice. Minimality is information-theoretic for deterministic queries that
+          retrieve existing NEW *bucket cumulative counts*, not arbitrary sketches.
+          
+          This file concerns exact rational interpolation; floating point corrections
+          and PromQL rate windows are outside the theorem.
+          """
+          from fractions import Fraction
+          from rounding_certificate import OldHistogram, _pair_opt, fq
+          
+          
+          def optimal_bucket_probes(old:OldHistogram,phi,T):
+              ns,lo,base=old.validate()
+              p=fq(phi);T=fq(T);N=old.count
+              if not 0<p<1 or N<1:return {'status':'UNSUPPORTED'}
+              B=old.bounds_ms
+              if T<0:return {'status':'CERTIFIED_FIRE','min_queries':0}
+              if T>=B[-1]:return {'status':'CERTIFIED_CLEAR','min_queries':0}
+              cum=old.cumulative[1:];edges=B[1:]
+              j=next(i for i,e in enumerate(edges) if T<=e)
+              if j==0:
+                  alpha=T/fq(edges[0])
+                  nominal=alpha*cum[0]
+                  old_j=[1];w=[alpha];new_j=[0]
+              else:
+                  low=edges[j-1];up=edges[j]
+                  alpha=(T-low)/fq(up-low)
+                  nominal=(1-alpha)*cum[j-1]+alpha*cum[j]
+                  old_j=[j,j+1];w=[1-alpha,alpha];new_j=[j-1,j]
+              costs=[B[i]-lo[i] for i in old_j]
+              caps=[ns[i] for i in old_j]
+              budget=old.sum_rounded_ms-base
+              gamma=nominal-p*N
+              if gamma<0:return {'status':'CERTIFIED_FIRE','min_queries':0}
+              mx,optimal_moves=_pair_opt(costs,caps,w,budget)
+              if mx<=gamma:return {'status':'CERTIFIED_CLEAR','min_queries':0}
+              if len(old_j)==1:
+                  return {'status':'UNDECIDABLE','min_queries':1,
+                          'sufficient_new_counter_edges_ms':[edges[j]],'two_counter_bound':1,
+                          'max_loss_moves':dict(zip([B[i] for i in old_j],optimal_moves))}
+              singleton=[]
+              ambiguities=[]
+              for fixed_index in (0,1):
+                  caps2=caps[:]
+                  if w[fixed_index]>0:
+                      caps2[fixed_index]=min(caps2[fixed_index],int(gamma//w[fixed_index]))
+                  # Any feasible configuration reaching FIRE while a fixed observed
+                  # count alone remains in the CLEAR region yields two source-compatible
+                  # worlds with the same observed new counter and opposite decisions.
+                  feasible_max,violating_pair=_pair_opt(costs,caps2,w,budget)
+                  if feasible_max<=gamma:
+                      singleton.append(edges[new_j[fixed_index]])
+                  else:
+                      ambiguities.append({'queried_edge_ms':edges[new_j[fixed_index]],
+                                          'shared_counter_moves':violating_pair[fixed_index],
+                                          'two_possible_fates':True})
+              return {'status':'UNDECIDABLE','min_queries':1 if singleton else 2,
+                      'sufficient_new_counter_edges_ms':singleton,
+                      'two_counter_edges_ms':[edges[i] for i in new_j],
+                      'exclusion_witnesses':ambiguities,
+                      'max_loss_moves':dict(zip([B[i] for i in old_j],optimal_moves)),
+                      'gamma':str(gamma)}
+          PY_QSEM_1
+          cat > exact_world_witness.py <<'PY_QSEM_2'
+          """Construct actual old-compatible event vectors from boundary-crossing decisions.
+          
+          This is an independent constructive check of the restricted integer-ms model;
+          not a Prometheus floating-point or rate-scrape proof.
+          """
+          from fractions import Fraction
+          from rounding_certificate import OldHistogram, old_from_ms, target_from_events_ms, _new_q, _pair_opt, fq
+          
+          
+          def build_world(hist: OldHistogram, moved=None, delta=0.25):
+              ns,lo,base=hist.validate()
+              B=hist.bounds_ms
+              moved={} if moved is None else dict(moved)
+              for j,z in moved.items():
+                  assert isinstance(j,int) and 1<=j<len(B)
+                  assert isinstance(z,int) and 0<=z<=ns[j]
+              rounded=[];moving=[];caps=[]
+              for j,n in enumerate(ns):
+                  at_edge=moved.get(j,0)
+                  hi=B[j] if j<len(B) else None
+                  for index in range(n):
+                      mover=index<at_edge
+                      rounded.append(hi if mover else lo[j])
+                      moving.append(mover)
+                      caps.append((hi-lo[j]) if hi is not None and not mover else None if hi is None else 0)
+              remaining=hist.sum_rounded_ms-sum(rounded)
+              assert remaining>=0
+              for k in range(len(rounded)):
+                  if remaining==0:break
+                  cap=caps[k]
+                  increment=remaining if cap is None else min(remaining,cap)
+                  rounded[k]+=increment
+                  remaining-=increment
+              if remaining:
+                  raise AssertionError('Budget feasible but world construction failed')
+              durations=[(r+delta if flag else r) for r,flag in zip(rounded,moving)]
+              h_check=old_from_ms(durations,hist.bounds_ms)
+              assert h_check==hist,(h_check,hist)
+              return durations
+          
+          
+          def ideal_alert_evidence(old,phi,tau):
+              ns,lo,base=old.validate()
+              p=fq(phi)
+              T=fq(tau)
+              if not 0<p<1:raise ValueError('PHI_OUTSIDE_RANGE')
+              if old.count==0:return {'status':'UNSUPPORTED'}
+              edges=old.bounds_ms[1:]
+              if T<0:return {'status':'CERTIFIED_FIRE'}
+              if T>=edges[-1]:return {'status':'CERTIFIED_CLEAR'}
+              right=next(i for i,e in enumerate(edges) if T<=e)
+              cum=old.cumulative[1:]
+              if right==0:
+                  alpha=T/fq(edges[0]);nominal=alpha*cum[0]
+                  js=[1];weights=[alpha]
+              else:
+                  low=edges[right-1];high=edges[right]
+                  alpha=(T-low)/fq(high-low)
+                  nominal=(1-alpha)*cum[right-1]+alpha*cum[right]
+                  js=[right,right+1];weights=[1-alpha,alpha]
+              costs=[old.bounds_ms[j]-lo[j] for j in js]
+              caps=[ns[j] for j in js]
+              maxloss,z=_pair_opt(costs,caps,weights,old.sum_rounded_ms-base)
+              rank=p*old.count
+              if nominal <rank:return {'status':'CERTIFIED_FIRE','nominal':nominal,'rank':rank}
+              if nominal-maxloss>=rank:return {'status':'CERTIFIED_CLEAR','nominal':nominal,'rank':rank}
+              baseline=build_world(old,{})
+              flip=build_world(old,dict(zip(js,z)))
+              bq=_new_q(phi,edges,target_from_events_ms(baseline,old.bounds_ms),old.count)
+              fqv=_new_q(phi,edges,target_from_events_ms(flip,old.bounds_ms),old.count)
+              assert bq<=T and fqv>T,(old,phi,T,bq,fqv,js,z)
+              return {'status':'UNDECIDABLE','baseline':baseline,'flipping':flip,'baseline_q':str(bq),'flipping_q':str(fqv),'movers':dict(zip(js,z)), 'nominal':str(nominal),'maxloss':str(maxloss),'rank':str(rank)}
+          PY_QSEM_2
+          cat > fast_guarded_certificate.py <<'PY_QSEM_3'
+          """Research candidate: scalable conservative binary64-aware classic-histogram certificate.
+          
+          NOT a formally verified general PromQL engine. The proof obligation is restricted:
+          nonnegative finite boundaries in whole milliseconds, two aligned static OTel
+          histograms, integer-ms legacy rounding and integer rounded old sum; each
+          per-bucket count and total count is an integer no larger than 2**52; phi in
+          [0.01, 0.99]; no native histograms / rate / missing labels / NaNs.
+          
+          Tracks the *binary64-rounded phi*N rank exactly as a dyadic Fraction*. Bounds
+          final interpolation error by a deliberately loose 32*u*maximum_finite_boundary
+          seconds, where u=2**-53, for positive normal arithmetic with 0<=start<end.
+          The preserved original two-item residue optimizer bounds the threshold CDF
+          without enumerating any event-count frontier. Decisive statuses are deliberately
+          conservative: a non-decisive status is not evidence of two feasible worlds.
+          """
+          from fractions import Fraction
+          from pathlib import Path
+          import sys,math
+          sys.path.insert(0,str(Path(__file__).resolve().parent))
+          from rounding_certificate import OldHistogram, _pair_opt, fq
+          
+          U = Fraction(1, 2**53)
+          
+          def D(x):
+              return Fraction.from_float(float(x))
+          
+          
+          def ideal_quantile(rank, bounds_sec, cums, count):
+              prevcount=0
+              prevbound=Fraction(0)
+              for boundary,cum in zip(bounds_sec,cums):
+                  if rank <= cum:
+                      return prevbound+(boundary-prevbound)*(rank-prevcount)/Fraction(cum-prevcount)
+                  prevcount=cum
+                  prevbound=boundary
+              return bounds_sec[-1]
+          
+          
+          def certify_fast_fp(old:OldHistogram,phi,threshold_ms):
+              ns,lo,minsum=old.validate()
+              p=float(phi)
+              if not (0.01 <= p <= 0.99) or not math.isfinite(p):
+                  return {'status':'UNSUPPORTED','reason':'RESTRICTED_PHI'}
+              n=old.count
+              if not (1<=n<=2**52):
+                  return {'status':'UNSUPPORTED','reason':'RESTRICTED_COUNT'}
+              finite_ms=old.bounds_ms[1:]
+              if not (all(1<=x<=10000000 for x in finite_ms)):
+                  return {'status':'UNSUPPORTED','reason':'BOUNDARY_RANGE'}
+              edges=[D(b/1000.0) for b in finite_ms]
+              if not all(a<b for a,b in zip(edges,edges[1:])):
+                  return {'status':'UNSUPPORTED','reason':'FLOAT_BOUNDARY_COLLISION'}
+              # dyadic exact representation of the already rounded Go float64 rank.
+              rank=D(p*float(n))
+              if not 0<rank<=n:
+                  return {'status':'UNSUPPORTED','reason':'NONPOSITIVE_RANK'}
+              tt=D(float(fq(threshold_ms)/1000))
+              if tt<0:
+                  return {'status':'CERTIFIED_FIRE','reason':'NEGATIVE_THRESHOLD'}
+              # Global absolute interpolation error bound, well above four float64 rounding errors.
+              error = 32*U*edges[-1]
+              cum=old.cumulative[1:]
+              baseline=ideal_quantile(rank,edges,cum,n)
+              if baseline>tt+error:
+                  return {'status':'CERTIFIED_FIRE','reason':'BELOW_MIN_QUANTILE'}
+              if tt>=edges[-1]+error:
+                  return {'status':'CERTIFIED_CLEAR','reason':'ABOVE_FINITE_CAP'}
+              tlo=tt-error
+              if tlo<=0:
+                  return {'status':'UNDECIDABLE','reason':'NEAR_NONNEGATIVE_BOUND'}
+              if tlo >=edges[-1]:
+                  return {'status':'UNDECIDABLE','reason':'NEAR_FINITE_CAP'}
+              right=next(i for i,x in enumerate(edges) if tlo<=x)
+              L=edges[right-1] if right else Fraction(0)
+              upper=edges[right]
+              alpha=(tlo-L)/(upper-L)
+              if right==0:
+                  nominal=alpha*cum[0]
+                  active=[1]
+                  weights=[alpha]
+              else:
+                  nominal=(1-alpha)*cum[right-1] + alpha*cum[right]
+                  active=[right,right+1]
+                  weights=[1-alpha,alpha]
+              costs=[old.bounds_ms[i]-lo[i] for i in active]
+              caps=[ns[i] for i in active]
+              budget=old.sum_rounded_ms-minsum
+              maxloss,_=_pair_opt(costs,caps,weights,budget)
+              if nominal-maxloss>=rank:
+                  return {'status':'CERTIFIED_CLEAR','reason':'WORST_CDF_EXCEEDS_FLOAT_RANK'}
+              return {'status':'UNDECIDABLE','reason':'CONSERVATIVE_PRECISION_OR_MOMENT_AMBIGUITY'}
+          PY_QSEM_3
+          cat > prometheus_safe_certificate.py <<'PY_QSEM_4'
+          """Extra Prometheus-3.15.1 monotonicity preprocessor guard for Q-SEM.
+          
+          This wrapper certifies the original fast numerical certificate ONLY if the
+          actual classic-histogram counts provably cannot have a small *positive* bucket
+          delta suppressed by Prometheus's ensureMonotonicAndIgnoreSmallDeltas (tolerance
+          1e-12). Counters are assumed static exact integers, no rate extrapolation.
+          
+          Not a new general PromQL verifier, not a mechanized IEEE-754 proof.
+          """
+          from rounding_certificate import OldHistogram
+          from fast_guarded_certificate import certify_fast_fp
+          
+          SMALL_DELTA_TOLERANCE_DENOM=10**12
+          GLOBAL_NO_SUPPRESSION_COUNT_LIMIT=400_000_000_000
+          EXACT_INTEGER_SUM_LIMIT=2**53
+          
+          
+          def guaranteed_no_delta_suppression(old:OldHistogram):
+              ns,lo,minsum=old.validate()
+              N=old.count
+              if N<=GLOBAL_NO_SUPPRESSION_COUNT_LIMIT:
+                  return True,'GLOBAL_INTEGER_DELTA_LOWER_BOUND'
+              # S must be exactly representable by cumulative float64 integer additions
+              if old.sum_rounded_ms>EXACT_INTEGER_SUM_LIMIT:
+                  return False,'LEGACY_SUM_NOT_PROVABLY_EXACT_FLOAT64'
+              budget=old.sum_rounded_ms-minsum
+              B=old.bounds_ms
+              K=len(B)-1
+              zmax={}
+              for j in range(1,K+1):
+                  c=B[j]-lo[j]
+                  zmax[j]=ns[j] if c==0 else min(ns[j],budget//c)
+              # New bucket 1 (the first positive finite boundary) is not compared against
+              # a previous bucket by Prometheus, so it cannot be delta-suppressed.
+              # For new bins 2..K: n_j-z_j+z_{j-1}; for +Inf: n_tail+z_K.
+              intervals=[]
+              for j in range(2,K+1):
+                  intervals.append((j, ns[j]-zmax[j], ns[j]+zmax[j-1]))
+              intervals.append(('+Inf', ns[K+1], ns[K+1]+zmax[K]))
+              for label,lower,upper in intervals:
+                  if upper==0:
+                      continue
+                  # Stronger than necessary: lower/(2*N) > 1.5e-12 whenever lower>3e-12*N.
+                  # Therefore a positive bucket delta cannot satisfy Prometheus's
+                  # strict rel-difference test, even with float64 rounding.
+                  if lower*SMALL_DELTA_TOLERANCE_DENOM>3*N:
+                      continue
+                  return False, f'POSSIBLE_SMALL_DELTA_AT_{label}'
+              return True,'BUCKET_LEVEL_NO_SUPPRESSION_BOUND'
+          
+          
+          def certify_safe(old:OldHistogram,phi,threshold_ms):
+              if old.sum_rounded_ms>EXACT_INTEGER_SUM_LIMIT:
+                  return {'status':'UNSUPPORTED','reason':'LEGACY_INTEGER_SUM_NOT_EXACT_IN_BINARY64'}
+              safe,reason=guaranteed_no_delta_suppression(old)
+              if not safe:return {'status':'UNSUPPORTED','reason':reason}
+              result=certify_fast_fp(old,phi,threshold_ms)
+              result['guard']=reason
+              return result
+          PY_QSEM_4
+          cat > prometheus_delta_reproducer.go <<'PY_QSEM_5'
+          package main
+          import (
+            "fmt"
+            "math"
+            "sort"
+          )
+          type Bucket struct{ UpperBound, Count float64 }
+          // Follows the published Prometheus v3.15.1 static BucketQuantile order,
+          // including ensureMonotonicAndIgnoreSmallDeltas and IEEE-754 math operations.
+          func qFloat(q float64, a []Bucket) (float64,int) {
+            b:=append([]Bucket(nil), a...)
+            sort.Slice(b,func(i,j int)bool{return b[i].UpperBound<b[j].UpperBound})
+            prev:=b[0].Count; ignored:=0
+            for i:=1;i<len(b);i++{
+              curr:=b[i].Count
+              if curr==prev {continue}
+              absSum:=math.Abs(prev)+math.Abs(curr)
+              diff:=math.Abs(prev-curr)
+              if diff/math.Min(absSum,math.MaxFloat64)<1e-12 { b[i].Count=prev; ignored++; continue}
+              if curr<prev {b[i].Count=prev;continue}
+              prev=curr
+            }
+            N:=b[len(b)-1].Count
+            rank:=q*N
+            idx:=sort.Search(len(b)-1,func(i int)bool{return b[i].Count>=rank})
+            if idx==len(b)-1{return b[len(b)-2].UpperBound,ignored}
+            if idx==0 && b[0].UpperBound<=0{return b[0].UpperBound,ignored}
+            start:=0.0;end:=b[idx].UpperBound;count:=b[idx].Count
+            if idx>0 {start=b[idx-1].UpperBound;count-=b[idx-1].Count;rank-=b[idx-1].Count}
+            return start+(end-start)*(rank/count),ignored
+          }
+          func main(){
+            N:=float64(10000000000000)
+            C1:=N/2-1
+            b:=[]Bucket{{0.005,C1},{0.010,N/2},{0.025,N/2+100},{0.05,N},{math.Inf(1),N}}
+            q,ignored:=qFloat(0.5,b)
+            fmt.Printf("N=%.0f, ignored=%d, quantile_ms=%.12f, T_ms=10.05, FIRE=%v\n",N,ignored,q*1000,q>0.01005)
+          }
+          PY_QSEM_5
+          cat > referee_audit.py <<'PY_QSEM_6'
+          #!/usr/bin/env python3
+          """Independent Q-SEM referee tests, NOT a general PromQL/float64 proof.
+          
+          Validates exact old-summary completeness and minimum 0/1/2 existing NEW bucket
+          counter acquisitions. All full-world labels are computed from events with a
+          separately written reference quantile; large-case optimization is independently
+          checked by SciPy MILP with integer-scaled objective weights.
+          """
+          from collections import defaultdict, Counter
+          from fractions import Fraction as F
+          from itertools import combinations_with_replacement, product
+          from math import lcm
+          from pathlib import Path
+          from time import perf_counter
+          import json, random
+          from scipy.optimize import Bounds, LinearConstraint, milp
+          from rounding_certificate import OldHistogram, old_from_ms, certify, target_from_events_ms, _pair_opt
+          from active_bucket_certificate import optimal_bucket_probes
+          from exact_world_witness import ideal_alert_evidence
+          
+          OUT=Path('out');OUT.mkdir(exist_ok=True)
+          
+          
+          def quantile_independent(phi, edges, cum, count):
+              # Independent fraction-only reference: inverse of the linearly interpolated CDF
+              rank=phi*count; low=F(0); prior=0
+              for edge, c in zip(edges,cum):
+                  if c>=rank:
+                      assert c>prior,(edge,c,prior,rank)
+                      return low+(F(edge)-low)*(rank-prior)/(c-prior)
+                  low=F(edge);prior=c
+              return F(edges[-1])
+          
+          
+          def all_worlds():
+              bounds=(0,3,6,10)
+              hist={}; possibilities=defaultdict(set); enumerated_worlds=0
+              # A NEW set of bounds, tie and boundary cases, distinct from Gate06.
+              for n in range(1,5):
+                  for rounded in combinations_with_replacement(range(12),n):
+                      old=old_from_ms(rounded,bounds)
+                      k=(old.cumulative,old.count,old.sum_rounded_ms)
+                      hist[k]=old
+                      alts=[(F(v)-F(1,4),F(v),F(v)+F(1,4)) if v in bounds[1:] else (F(v),) for v in rounded]
+                      for vals in product(*alts):
+                          assert all(x>=0 for x in vals)
+                          cu=tuple(target_from_events_ms(vals,bounds))
+                          possibilities[k].add(cu)
+                          enumerated_worlds+=1
+              phis=(F(1,3),F(1,2),F(3,4),F(9,10),F(19,20))
+              thresholds=tuple(F(x,2) for x in range(-2,24))
+              checks=Counter(); mistakes=[]; examples=[]
+              for key, vectors in possibilities.items():
+                  h=hist[key]; n=h.count
+                  for phi in phis:
+                      qs={c:quantile_independent(phi,bounds[1:],c,n) for c in vectors}
+                      for T in thresholds:
+                          truths={c:(q>T) for c,q in qs.items()}
+                          classes=set(truths.values())
+                          expected_status=('CERTIFIED_FIRE' if classes=={True} else
+                                           'CERTIFIED_CLEAR' if classes=={False} else 'UNDECIDABLE')
+                          pred=certify(h,phi,T)
+                          plan=optimal_bucket_probes(h,phi,T)
+                          if expected_status=='UNDECIDABLE':
+                              j=next(i for i,v in enumerate(bounds[1:]) if T<=v)
+                              relevant=(j,) if j==0 else (j-1,j)
+                              enough=[]
+                              for coordinate in relevant:
+                                  groups=defaultdict(set)
+                                  for cum,flag in truths.items():groups[cum[coordinate]].add(flag)
+                                  if all(len(labels)==1 for labels in groups.values()):
+                                      enough.append(bounds[1:][coordinate])
+                              expected_min=1 if enough else 2
+                              if expected_min==1 and not set(plan.get('sufficient_new_counter_edges_ms',[]))==set(enough):
+                                  mistakes.append(('SINGLETON_EDGE',str(key),str(phi),str(T),enough,plan))
+                              checks['unknown_count']+=1
+                              if len(examples)<8 and expected_min==2:
+                                  proof=ideal_alert_evidence(h,phi,T)
+                                  if proof['status']!='UNDECIDABLE':
+                                      mistakes.append(('WITNESS_MISSING',str(key),str(phi),str(T)))
+                                  else:
+                                      examples.append({'old_n':n,'phi':str(phi),'T':str(T),
+                                                       'witness_no_fire_q':proof['baseline_q'],
+                                                       'witness_fire_q':proof['flipping_q']})
+                          else:
+                              expected_min=0
+                          if pred['status']!=expected_status or plan['status']!=expected_status or plan['min_queries']!=expected_min:
+                              mistakes.append(('INCORRECT',str(key),str(phi),str(T),expected_status,expected_min,pred,plan))
+                              if len(mistakes)>10:break
+                          checks['decisions']+=1
+                          checks['need_'+str(expected_min)] += 1
+                      if len(mistakes)>10:break
+                  if len(mistakes)>10:break
+              report={'status':'PASS' if not mistakes else 'FAIL', 'new_bounds_ms':bounds,
+                      'distinct_old_summaries':len(possibilities),
+                      'raw_world_placements':enumerated_worlds,
+                      'independent_exact_decision_checks':checks['decisions'],
+                      'unknown_cases':checks['unknown_count'],
+                      'needed_new_counters':{k:checks[k] for k in ('need_0','need_1','need_2')},
+                      'opposite_witness_samples':examples,
+                      'errors':mistakes[:3],
+                      'limits':'Exact rational classic histogram, integer-ms rounded old observations, static sums; no PromQL rate or float64 theorem'}
+              (OUT/'independent_world_oracle.json').write_text(json.dumps(report,indent=2,default=str))
+              print('INDEPENDENT_EXACT',report['status'],report['independent_exact_decision_checks'], 'errors',len(mistakes),flush=True)
+              if mistakes:raise AssertionError(mistakes[:1])
+              return report
+          
+          
+          def decode_problem(h,phi,T):
+              ns,lower,base=h.validate();bounds=h.bounds_ms;edges=bounds[1:]
+              j=next(i for i,e in enumerate(edges) if T<=e)
+              if j==0:
+                  weights=[T/F(edges[0])]; indices=[1];nom=weights[0]*h.cumulative[1]
+              else:
+                  alpha=(T-edges[j-1])/F(edges[j]-edges[j-1]); weights=[1-alpha,alpha]
+                  indices=[j,j+1];nom=(1-alpha)*h.cumulative[j]+alpha*h.cumulative[j+1]
+              return [bounds[i]-lower[i] for i in indices],[ns[i] for i in indices],weights,h.sum_rounded_ms-base,nom-phi*h.count
+          
+          
+          def exact_milp_opt(costs,caps,weights,budget):
+              # Integer-weight objective avoids FP conversion of rational coefficients.
+              den=1
+              for w in weights:den=lcm(den,w.denominator)
+              obj=[int(w*den) for w in weights]
+              r=milp(c=[-float(x) for x in obj],integrality=[1]*len(obj),
+                     bounds=Bounds([0]*len(obj),caps),
+                     constraints=LinearConstraint([costs],-float('inf'),budget),
+                     options={'mip_rel_gap':0,'time_limit':15})
+              if not r.success:raise AssertionError(('MILP_SOLVER',r.message,costs,caps,budget,obj))
+              xy=[int(round(v)) for v in r.x]
+              assert all(0<=x<=cap for x,cap in zip(xy,caps))
+              assert sum(c*x for c,x in zip(costs,xy))<=budget
+              assert abs(sum(a*x for a,x in zip(obj,xy))+r.fun)<1e-5
+              return sum(w*x for w,x in zip(weights,xy)),xy
+          
+          
+          def new_milp():
+              rng=random.Random(737173); B=(0,5,10,25,50,100,250,500)
+              samples=[];screened=0;by_n={}
+              for scale in (200,2000,20000,200000):
+                  accepted=0
+                  for _ in range(250):
+                      N=scale
+                      # Uniformly random multinomial via weights: old summaries are realisable.
+                      raw=[rng.uniform(.5,3) for _ in range(len(B)+1)]
+                      ns=[int(N*w/sum(raw)) for w in raw]
+                      ns[0]+=N-sum(ns)
+                      if min(ns)<0:continue
+                      lo=[0]+[B[j-1]+1 for j in range(1,len(B))]+[B[-1]+1]
+                      base=sum(a*b for a,b in zip(ns,lo))
+                      maxextra=sum(ns[j]*(B[j]-lo[j]) for j in range(len(B)))
+                      extra=rng.randint(maxextra//5,4*maxextra//5)
+                      cs=[];s=0
+                      for x in ns[:-1]:s+=x;cs.append(s)
+                      h=OldHistogram(B,tuple(cs),N,base+extra)
+                      h.validate()
+                      ph=rng.choice([F(1,2),F(3,4),F(9,10),F(19,20),F(99,100)])
+                      for j in range(1,len(B)-1):
+                          for fraction in (F(1,3),F(1,2),F(3,4)):
+                              T=F(B[j-1])+(B[j]-B[j-1])*fraction
+                              screened+=1
+                              plan=optimal_bucket_probes(h,ph,T)
+                              if plan['status']=='UNDECIDABLE':
+                                  samples.append((h,ph,T,plan,scale))
+                                  accepted+=1;break
+                          if accepted>=20:break
+                      if accepted>=20:break
+                  by_n[scale]=accepted
+              if len(samples)<40:raise AssertionError(('NOT_ENOUGH_INDEPENDENT_CASES',by_n))
+              comparisons=Counter();fail=[];t_active=0;t_milp=0
+              for h,phi,T,plan,scale in samples:
+                  costs,caps,weights,budget,gamma=decode_problem(h,phi,T)
+                  if len(weights)!=2:continue
+                  t0=perf_counter(); check=optimal_bucket_probes(h,phi,T);t_active+=perf_counter()-t0
+                  if check['status']!='UNDECIDABLE':raise AssertionError('RANDOM_CASE_CHANGED')
+                  t0=perf_counter();full,_=exact_milp_opt(costs,caps,weights,budget);t_milp+=perf_counter()-t0
+                  comparisons['full_milp']+=1
+                  alg_full,_=_pair_opt(costs,caps,weights,budget)
+                  if alg_full!=full:fail.append(('full_objective',str(full),str(alg_full)))
+                  if full<=gamma:fail.append(('full',str(T),str(phi)))
+                  one=[]
+                  for i in (0,1):
+                      newcaps=caps[:]
+                      if weights[i]>0:newcaps[i]=min(caps[i],int(gamma//weights[i]))
+                      t0=perf_counter();opt,_=exact_milp_opt(costs,newcaps,weights,budget);t_milp+=perf_counter()-t0
+                      comparisons['restricted_milp']+=1
+                      alg_restricted,_=_pair_opt(costs,newcaps,weights,budget)
+                      if alg_restricted!=opt:fail.append(('restricted_objective',i,str(opt),str(alg_restricted)))
+                      if opt<=gamma:
+                          j=next(j for j,v in enumerate(h.bounds_ms[1:]) if T<=v)
+                          one.append(h.bounds_ms[1:][j-1+i])
+                  expected=1 if one else 2
+                  if expected!=plan['min_queries'] or (expected==1 and set(one)!=set(plan['sufficient_new_counter_edges_ms'])):fail.append(('minimum_counter',str(phi),str(T),expected,one,plan))
+                  comparisons['minimum_labels']+=1
+              report={'status':'PASS' if not fail else 'FAIL','seed':737173,'unknown_samples':len(samples),
+                      'samples_per_n':by_n,'screened_candidate_queries':screened,
+                      'independent_milp_objectives':comparisons['full_milp']+comparisons['restricted_milp'],
+                      'minimal_query_labels_checked':comparisons['minimum_labels'],
+                      'candidate_decision_seconds':round(t_active,4),'milp_three_solves_seconds':round(t_milp,4),
+                      'not_a_full_runtime_benchmark':True,'errors':fail[:4]}
+              (OUT/'independent_milp.json').write_text(json.dumps(report,indent=2,default=str))
+              print('INDEPENDENT_MILP',report['status'],report['unknown_samples'], 'errors',len(fail),flush=True)
+              if fail:raise AssertionError(fail[:1])
+              return report
+          
+          
+          def frozen_real():
+              # Frozen, hashed Gate03 metrics. This is an audit, not a fresh OTel run.
+              record=json.loads(Path('frozen_real_otel.json').read_text())
+              old=record['old_aggregate'];new=record['new_aggregate']
+              assert record['status']=='PASS' and record['requests']==75
+              cs=[];s=0
+              for x in old['counts'][:-1]:s+=x;cs.append(s)
+              h=OldHistogram(tuple(map(int,old['boundaries'])),tuple(cs),old['count'],int(old['sum']))
+              h.validate()
+              decision=optimal_bucket_probes(h,F(99,100),F(25))
+              assert decision['status']=='UNDECIDABLE' and decision['min_queries']==1
+              assert 25 in decision['sufficient_new_counter_edges_ms']
+              checks=0
+              for row in record['certificates']:
+                  phi=F(str(row['phi'])); T=F(str(row['threshold_ms']))
+                  result=optimal_bucket_probes(h,phi,T)
+                  assert result['status']==row['certificate'],(row,result)
+                  checks+=1
+              report={'status':'PASS','frozen_opentelemetry_requests':75,
+                      'old_rounded_sum_ms':h.sum_rounded_ms,'decision_queries_matched':checks,
+                      'ambiguous_phi':'.99','ambiguous_threshold_ms':25,
+                      'optimal_new_counter_ms':25,
+                      'scope':'Gate03 preserved localhost dual-emission evidence, NO new production paired metrics'}
+              (OUT/'frozen_otel_crosscheck.json').write_text(json.dumps(report,indent=2))
+              print('FROZEN_OTEL',report['status'],flush=True)
+              return report
+          
+          
+          def main():
+              res={'exact_worlds':all_worlds(),'milp':new_milp(),'frozen_otel':frozen_real()}
+              (OUT/'referee_summary.json').write_text(json.dumps({'status':'PASS','subtests':{k:v['status'] for k,v in res.items()},'novelty_at_least_8_5_proven':False,
+                  'important_limits':['Static classic histogram only','Exact-rational minimal-information theorem; not general float64 proof',
+                      'NO independent production OTel stream','No general rate/resets/scrape gaps','No peer-reviewed novelty score inference']},indent=2))
+              print('REFEREE_LOCAL_PASS',flush=True)
+          if __name__=='__main__':main()
+          PY_QSEM_6
+          cat > prometheus_fixture.py <<'PY_QSEM_7'
+          #!/usr/bin/env python3
+          """Targeted v3.15.1 counterexample, not a general rate/scrape test."""
+          from pathlib import Path
+          import json
+          import yaml
+          from rounding_certificate import OldHistogram
+          from fast_guarded_certificate import certify_fast_fp
+          from prometheus_safe_certificate import certify_safe
+          out=Path('out');out.mkdir(exist_ok=True)
+          N=10**13
+          c1=N//2-1; c2=N//2; c3=N//2+100
+          old=OldHistogram((0,5,10,25,50),(0,c1,c2,c3,N),N,
+                           c1+6+100*11+(N-c3)*26)
+          old.validate()
+          legacy=certify_fast_fp(old,0.5,10.05)
+          safe=certify_safe(old,0.5,10.05)
+          assert legacy['status']=='CERTIFIED_CLEAR'
+          assert safe['status']=='UNSUPPORTED'
+          cases={
+            'small_delta':{'phi':0.5,'threshold':0.01005,'expected':1,
+               'cum': [('0.005',c1),('0.01',c2),('0.025',c3),('0.05',N),('+Inf',N)]},
+            'precision_boundary_control':{'phi':0.9,'threshold':0.009,'expected':1,
+               'cum':[('0.005',50),('0.01',100),('0.025',100),('+Inf',100)]},
+            'nonfire_control':{'phi':0.9,'threshold':0.007,'expected':0,
+               'cum':[('0.005',90),('0.01',100),('0.025',100),('+Inf',100)]},
+          }
+          series=[];queries=[]
+          for name,c in cases.items():
+              for le,val in c['cum']:
+                  series.append({'series':f'qsem_target_bucket{{scenario="{name}",le="{le}"}}','values':f'{val} {val}'})
+              queries.append({'expr':f'histogram_quantile({c["phi"]}, qsem_target_bucket{{scenario="{name}"}}) > bool {c["threshold"]}',
+                              'eval_time':'1m','exp_samples':[{'labels':f'{{scenario="{name}"}}','value':c['expected']}]})
+          fixture={'rule_files':[], 'evaluation_interval':'1m',
+                   'tests':[{'interval':'1m','input_series':series,'promql_expr_test':queries}]}
+          (out/'promql_referee.yml').write_text(yaml.safe_dump(fixture,sort_keys=False))
+          manifest={'status':'FIXTURES_BUILT','testcases':len(cases),'real_target':'promtool 3.15.1',
+                    'old_gate05_certificate':legacy['status'],
+                    'corrected_gate06_certificate':safe['status'],
+                    'safe_reason':safe['reason'],
+                    'high_population_size':N,
+                    'high_population_expected_float_alertevent':True,
+                    'limits':'No raw production scrape; static instant-vector classic histogram only'}
+          (out/'prometheus_manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('PROMETHEUS_FIXTURES_READY',len(cases))
+          PY_QSEM_7
+          cat > frozen_real_otel.b64 <<'B64_QSEM_REAL'
+          ewogICJ0ZXN0IjogIlJFQUxfVVJMT1BFTlRFTF9JTlNUUlVNRU5UQVRJT05fSFRUUF9EVVAiLAog
+          ICJzdGF0dXMiOiAiUEFTUyIsCiAgImluc3RydW1lbnRhdGlvbl92ZXJzaW9uIjogIjAuNjNiMSIs
+          CiAgInNka192ZXJzaW9uIjogIjEuNDIuMSIsCiAgInJlcXVlc3RzIjogNzUsCiAgIm9sZF9tZXRy
+          aWMiOiAiaHR0cC5jbGllbnQuZHVyYXRpb24iLAogICJuZXdfbWV0cmljIjogImh0dHAuY2xpZW50
+          LnJlcXVlc3QuZHVyYXRpb24iLAogICJvbGRfYWdncmVnYXRlIjogewogICAgImJvdW5kYXJpZXMi
+          OiBbCiAgICAgIDAuMCwKICAgICAgNS4wLAogICAgICAxMC4wLAogICAgICAyNS4wLAogICAgICA1
+          MC4wLAogICAgICA3NS4wLAogICAgICAxMDAuMCwKICAgICAgMjUwLjAsCiAgICAgIDUwMC4wLAog
+          ICAgICA3NTAuMCwKICAgICAgMTAwMC4wLAogICAgICAyNTAwLjAsCiAgICAgIDUwMDAuMCwKICAg
+          ICAgNzUwMC4wLAogICAgICAxMDAwMC4wCiAgICBdLAogICAgImNvdW50IjogNzUsCiAgICAic3Vt
+          IjogNDk4LAogICAgImNvdW50cyI6IFsKICAgICAgMiwKICAgICAgMjMsCiAgICAgIDI1LAogICAg
+          ICAyNSwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAg
+          MCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMCwKICAgICAgMAog
+          ICAgXSwKICAgICJudW1iZXJfb2ZfYXR0cmlidXRlX2dyb3VwcyI6IDMKICB9LAogICJuZXdfYWdn
+          cmVnYXRlIjogewogICAgImJvdW5kYXJpZXMiOiBbCiAgICAgIDAuMDA1LAogICAgICAwLjAxLAog
+          ICAgICAwLjAyNSwKICAgICAgMC4wNSwKICAgICAgMC4wNzUsCiAgICAgIDAuMSwKICAgICAgMC4y
+          NSwKICAgICAgMC41LAogICAgICAwLjc1LAogICAgICAxLAogICAgICAyLjUsCiAgICAgIDUsCiAg
+          ICAgIDcuNSwKICAgICAgMTAKICAgIF0sCiAgICAiY291bnQiOiA3NSwKICAgICJzdW0iOiAwLjQ3
+          NzkzMDYwMjAwMDAwMDcsCiAgICAiY291bnRzIjogWwogICAgICAyNSwKICAgICAgMjUsCiAgICAg
+          IDI1LAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAw
+          LAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAwLAogICAgICAwCiAg
+          ICBdLAogICAgIm51bWJlcl9vZl9hdHRyaWJ1dGVfZ3JvdXBzIjogMQogIH0sCiAgImNlcnRpZmlj
+          YXRlcyI6IFsKICAgIHsKICAgICAgInBoaSI6IDAuNSwKICAgICAgInRocmVzaG9sZF9tcyI6IDMs
+          CiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfRklSRSIsCiAgICAgICJvYnNlcnZlZF90
+          YXJnZXRfcXVhbnRpbGVfbXMiOiA3LjUsCiAgICAgICJvYnNlcnZlZF9hbGVydCI6IHRydWUKICAg
+          IH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjUsCiAgICAgICJ0aHJlc2hvbGRfbXMiOiA1LAogICAg
+          ICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0ZJUkUiLAogICAgICAib2JzZXJ2ZWRfdGFyZ2V0
+          X3F1YW50aWxlX21zIjogNy41LAogICAgICAib2JzZXJ2ZWRfYWxlcnQiOiB0cnVlCiAgICB9LAog
+          ICAgewogICAgICAicGhpIjogMC41LAogICAgICAidGhyZXNob2xkX21zIjogNywKICAgICAgImNl
+          cnRpZmljYXRlIjogIkNFUlRJRklFRF9GSVJFIiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFu
+          dGlsZV9tcyI6IDcuNSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogdHJ1ZQogICAgfSwKICAgIHsK
+          ICAgICAgInBoaSI6IDAuNSwKICAgICAgInRocmVzaG9sZF9tcyI6IDEwLAogICAgICAiY2VydGlm
+          aWNhdGUiOiAiQ0VSVElGSUVEX0NMRUFSIiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGls
+          ZV9tcyI6IDcuNSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogZmFsc2UKICAgIH0sCiAgICB7CiAg
+          ICAgICJwaGkiOiAwLjUsCiAgICAgICJ0aHJlc2hvbGRfbXMiOiAxNSwKICAgICAgImNlcnRpZmlj
+          YXRlIjogIkNFUlRJRklFRF9DTEVBUiIsCiAgICAgICJvYnNlcnZlZF90YXJnZXRfcXVhbnRpbGVf
+          bXMiOiA3LjUsCiAgICAgICJvYnNlcnZlZF9hbGVydCI6IGZhbHNlCiAgICB9LAogICAgewogICAg
+          ICAicGhpIjogMC41LAogICAgICAidGhyZXNob2xkX21zIjogMjUsCiAgICAgICJjZXJ0aWZpY2F0
+          ZSI6ICJDRVJUSUZJRURfQ0xFQVIiLAogICAgICAib2JzZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21z
+          IjogNy41LAogICAgICAib2JzZXJ2ZWRfYWxlcnQiOiBmYWxzZQogICAgfSwKICAgIHsKICAgICAg
+          InBoaSI6IDAuNSwKICAgICAgInRocmVzaG9sZF9tcyI6IDUwLAogICAgICAiY2VydGlmaWNhdGUi
+          OiAiQ0VSVElGSUVEX0NMRUFSIiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6
+          IDcuNSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogZmFsc2UKICAgIH0sCiAgICB7CiAgICAgICJw
+          aGkiOiAwLjksCiAgICAgICJ0aHJlc2hvbGRfbXMiOiAzLAogICAgICAiY2VydGlmaWNhdGUiOiAi
+          Q0VSVElGSUVEX0ZJUkUiLAogICAgICAib2JzZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjAu
+          NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogdHJ1ZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6
+          IDAuOSwKICAgICAgInRocmVzaG9sZF9tcyI6IDUsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJU
+          SUZJRURfRklSRSIsCiAgICAgICJvYnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyMC41LAog
+          ICAgICAib2JzZXJ2ZWRfYWxlcnQiOiB0cnVlCiAgICB9LAogICAgewogICAgICAicGhpIjogMC45
+          LAogICAgICAidGhyZXNob2xkX21zIjogNywKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklF
+          RF9GSVJFIiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDIwLjUsCiAgICAg
+          ICJvYnNlcnZlZF9hbGVydCI6IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjksCiAg
+          ICAgICJ0aHJlc2hvbGRfbXMiOiAxMCwKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9G
+          SVJFIiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDIwLjUsCiAgICAgICJv
+          YnNlcnZlZF9hbGVydCI6IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjksCiAgICAg
+          ICJ0aHJlc2hvbGRfbXMiOiAxNSwKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9GSVJF
+          IiwKICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDIwLjUsCiAgICAgICJvYnNl
+          cnZlZF9hbGVydCI6IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjksCiAgICAgICJ0
+          aHJlc2hvbGRfbXMiOiAyNSwKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9DTEVBUiIs
+          CiAgICAgICJvYnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyMC41LAogICAgICAib2JzZXJ2
+          ZWRfYWxlcnQiOiBmYWxzZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOSwKICAgICAgInRo
+          cmVzaG9sZF9tcyI6IDUwLAogICAgICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0NMRUFSIiwK
+          ICAgICAgIm9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDIwLjUsCiAgICAgICJvYnNlcnZl
+          ZF9hbGVydCI6IGZhbHNlCiAgICB9LAogICAgewogICAgICAicGhpIjogMC45NSwKICAgICAgInRo
+          cmVzaG9sZF9tcyI6IDMsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfRklSRSIsCiAg
+          ICAgICJvYnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyMi43NSwKICAgICAgIm9ic2VydmVk
+          X2FsZXJ0IjogdHJ1ZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOTUsCiAgICAgICJ0aHJl
+          c2hvbGRfbXMiOiA1LAogICAgICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0ZJUkUiLAogICAg
+          ICAib2JzZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjIuNzUsCiAgICAgICJvYnNlcnZlZF9h
+          bGVydCI6IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjk1LAogICAgICAidGhyZXNo
+          b2xkX21zIjogNywKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9GSVJFIiwKICAgICAg
+          Im9ic2VydmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDIyLjc1LAogICAgICAib2JzZXJ2ZWRfYWxl
+          cnQiOiB0cnVlCiAgICB9LAogICAgewogICAgICAicGhpIjogMC45NSwKICAgICAgInRocmVzaG9s
+          ZF9tcyI6IDEwLAogICAgICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0ZJUkUiLAogICAgICAi
+          b2JzZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjIuNzUsCiAgICAgICJvYnNlcnZlZF9hbGVy
+          dCI6IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjk1LAogICAgICAidGhyZXNob2xk
+          X21zIjogMTUsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfRklSRSIsCiAgICAgICJv
+          YnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyMi43NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0
+          IjogdHJ1ZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOTUsCiAgICAgICJ0aHJlc2hvbGRf
+          bXMiOiAyNSwKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9DTEVBUiIsCiAgICAgICJv
+          YnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyMi43NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0
+          IjogZmFsc2UKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjk1LAogICAgICAidGhyZXNob2xk
+          X21zIjogNTAsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfQ0xFQVIiLAogICAgICAi
+          b2JzZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjIuNzUsCiAgICAgICJvYnNlcnZlZF9hbGVy
+          dCI6IGZhbHNlCiAgICB9LAogICAgewogICAgICAicGhpIjogMC45OSwKICAgICAgInRocmVzaG9s
+          ZF9tcyI6IDMsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfRklSRSIsCiAgICAgICJv
+          YnNlcnZlZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyNC41NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0
+          IjogdHJ1ZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOTksCiAgICAgICJ0aHJlc2hvbGRf
+          bXMiOiA1LAogICAgICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0ZJUkUiLAogICAgICAib2Jz
+          ZXJ2ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjQuNTUsCiAgICAgICJvYnNlcnZlZF9hbGVydCI6
+          IHRydWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjk5LAogICAgICAidGhyZXNob2xkX21z
+          IjogNywKICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9GSVJFIiwKICAgICAgIm9ic2Vy
+          dmVkX3RhcmdldF9xdWFudGlsZV9tcyI6IDI0LjU1LAogICAgICAib2JzZXJ2ZWRfYWxlcnQiOiB0
+          cnVlCiAgICB9LAogICAgewogICAgICAicGhpIjogMC45OSwKICAgICAgInRocmVzaG9sZF9tcyI6
+          IDEwLAogICAgICAiY2VydGlmaWNhdGUiOiAiQ0VSVElGSUVEX0ZJUkUiLAogICAgICAib2JzZXJ2
+          ZWRfdGFyZ2V0X3F1YW50aWxlX21zIjogMjQuNTUsCiAgICAgICJvYnNlcnZlZF9hbGVydCI6IHRy
+          dWUKICAgIH0sCiAgICB7CiAgICAgICJwaGkiOiAwLjk5LAogICAgICAidGhyZXNob2xkX21zIjog
+          MTUsCiAgICAgICJjZXJ0aWZpY2F0ZSI6ICJDRVJUSUZJRURfRklSRSIsCiAgICAgICJvYnNlcnZl
+          ZF90YXJnZXRfcXVhbnRpbGVfbXMiOiAyNC41NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogdHJ1
+          ZQogICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOTksCiAgICAgICJ0aHJlc2hvbGRfbXMiOiAy
+          NSwKICAgICAgImNlcnRpZmljYXRlIjogIlVOREVDSURBQkxFIiwKICAgICAgIm9ic2VydmVkX3Rh
+          cmdldF9xdWFudGlsZV9tcyI6IDI0LjU1LAogICAgICAib2JzZXJ2ZWRfYWxlcnQiOiBmYWxzZQog
+          ICAgfSwKICAgIHsKICAgICAgInBoaSI6IDAuOTksCiAgICAgICJ0aHJlc2hvbGRfbXMiOiA1MCwK
+          ICAgICAgImNlcnRpZmljYXRlIjogIkNFUlRJRklFRF9DTEVBUiIsCiAgICAgICJvYnNlcnZlZF90
+          YXJnZXRfcXVhbnRpbGVfbXMiOiAyNC41NSwKICAgICAgIm9ic2VydmVkX2FsZXJ0IjogZmFsc2UK
+          ICAgIH0KICBdLAogICJjZXJ0aWZpZWQiOiAyNywKICAic2NvcGUiOiAiYWN0dWFsIGxvY2FsaG9z
+          dCB1cmxsaWIgcmVxdWVzdHMsIHNhbWUtcHJvY2VzcyBkdWFsLWVtaXNzaW9uOyBydW50aW1lIHRp
+          bWluZ3MgdW5jb250cm9sbGVkOyBncm91cGVkIGFjcm9zcyBhdHRyaWJ1dGVzIiwKICAibGltaXRh
+          dGlvbnMiOiBbCiAgICAiU0RLIGluc3RydW1lbnQgZGF0YSBpbi1tZW1vcnksIG5vdCBQcm9tZXRo
+          ZXVzIHNjcmFwZS9yYXRlIiwKICAgICJsYWJlbHMgYXJlIGFnZ3JlZ2F0ZWQ7IG9ubHkgZnVsbC1w
+          cm9jZXNzIHRvdGFsIHBhaXJpbmcgaXMgY2hlY2tlZCIsCiAgICAiY2VydGlmaWNhdGUgYXBwbGll
+          cyB0byBzdGF0aWMgdG90YWxzLCBub3QgYXJiaXRyYXJ5IFByb21RTCB3aW5kb3dzL3Jlc2V0cyIK
+          ICBdCn0=
+          B64_QSEM_REAL
+          base64 --decode frozen_real_otel.b64 > frozen_real_otel.json
+          rm frozen_real_otel.b64
+          cat > out/pinned_sha256.txt <<'SHA_QSEM'
+          fcd69b3c58dd24e6c5fea177fb3b8303d750659c2c4a009a65a96dee1caed311  rounding_certificate.py
+          de1caee64d869f6ae7ab753b94c1868b7cd710c16e88a61b946245511388d7a7  active_bucket_certificate.py
+          27d80a1ce1b881023f37ace307b1dfbc5509d0c918aa16a7490d5b0238064512  exact_world_witness.py
+          17cee7856a6b6720b16cb59baa3be88ff34c77c784947d79ad6d7098ddca07f6  fast_guarded_certificate.py
+          9bd30c5cb2a0582e1b174b64bc8a1e87923cedbc0b967ff1ac147b7e0f4efddc  prometheus_safe_certificate.py
+          a8de6e93259268b23210ae86675984998d925e64090440671cd20cce99368341  prometheus_delta_reproducer.go
+          d16127cdd69b2cd8f56547d15531ffcd95f5458fa6f5bf5369158899a3bdfe29  frozen_real_otel.json
+          SHA_QSEM
+          sha256sum -c out/pinned_sha256.txt | tee out/integrity_checks.log
+          cp frozen_real_otel.json out/frozen_real_otel.json
+          python - <<'PY'
+          import json, pathlib, hashlib
+          a={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path(".").glob("*.py")}
+          pathlib.Path("out/implemented_sources.json").write_text(json.dumps(a,indent=2))
+          print("FROZEN_SOURCE_HASHES_VERIFIED")
+          PY
+      - name: Independent full worlds, minimum counters, integer objective MILP
+        id: referee
+        shell: bash
+        run: |
+          set -euo pipefail
+          python referee_audit.py 2>&1 | tee out/referee.log
+          test -s out/referee_summary.json
+          python - <<'PY'
+          import json
+          r=json.load(open('out/referee_summary.json'))
+          assert r['status']=='PASS',r
+          print('INDEPENDENT_REFEREE_PASS')
+          PY
+      - name: Reproduce precision counterexample with standalone Go kernel
+        id: go
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version | tee out/go_version.txt
+          GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off go run prometheus_delta_reproducer.go 2>&1 | tee out/go_precision_kernel.log
+          grep -q 'ignored=1' out/go_precision_kernel.log
+          grep -q 'FIRE=true' out/go_precision_kernel.log
+      - name: Build targeted true-Prometheus precision fixtures
+        id: fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python prometheus_fixture.py 2>&1 | tee out/prometheus_fixture.log
+          test -s out/promql_referee.yml
+          test -s out/prometheus_manifest.json
+      - name: Download SHA256-verified Prometheus promtool 3.15.1
+        id: download
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            -o prometheus.tar.gz https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.linux-amd64.tar.gz 2>&1 | tee out/prometheus_download.log
+          echo '6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84  prometheus.tar.gz' | sha256sum -c - | tee out/prometheus_checksum.log
+          tar -xzf prometheus.tar.gz prometheus-3.15.1.linux-amd64/promtool
+          mv prometheus-3.15.1.linux-amd64/promtool ./promtool
+          chmod +x ./promtool
+          ./promtool --version | tee out/promtool_version.txt
+      - name: Run actual Prometheus high-count small-delta and controls
+        id: promql
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./promtool test rules out/promql_referee.yml 2>&1 | tee out/prometheus_referee.log
+          grep -q 'SUCCESS' out/prometheus_referee.log
+      - name: Audit final completeness and scientific limits
+        if: always()
+        shell: bash
+        env:
+          QSEM_STAGE_DEPS: ${{ steps.deps.outcome }}
+          QSEM_STAGE_RESTORE: ${{ steps.restore.outcome }}
+          QSEM_STAGE_REFEREE: ${{ steps.referee.outcome }}
+          QSEM_STAGE_GO: ${{ steps.go.outcome }}
+          QSEM_STAGE_FIXTURES: ${{ steps.fixtures.outcome }}
+          QSEM_STAGE_DOWNLOAD: ${{ steps.download.outcome }}
+          QSEM_STAGE_PROMQL: ${{ steps.promql.outcome }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os,json
+          out=Path('out');out.mkdir(exist_ok=True)
+          stages={k.removeprefix('QSEM_STAGE_').lower():v for k,v in os.environ.items() if k.startswith('QSEM_STAGE_')}
+          needed=['integrity_checks.log','independent_world_oracle.json','independent_milp.json','frozen_otel_crosscheck.json','referee_summary.json','go_precision_kernel.log','promql_referee.yml','prometheus_referee.log']
+          missing=[x for x in needed if not (out/x).is_file() or (out/x).stat().st_size==0]
+          failed=[k for k,v in stages.items() if v!='success']
+          state='PASS' if not missing and not failed else 'INCOMPLETE_OR_FAILED'
+          result={
+           'status':state,'stage_outcomes':stages,'missing_outputs':missing,'failed_or_skipped_stages':failed,
+           'independent_exact_scope':'integer-rounded static classic histogram; exhaustive small worlds',
+           'independent_optimizer_scope':'same old count/sum, SciPy MILP; not more decisive than exact ideal oracle',
+           'prometheus_scope':'3 targeted static true-Prometheus cases, NOT general PromQL rate/reset or all binary64 corner cases',
+           'frozen_otel_scope':'archived 75 localhost paired requests, not independent production paired metrics',
+           'minimum_counter_scope':'existing NEW cumulative bucket counters only; not arbitrary new sketches',
+           'novelty_above_8_5_proven':False,'paper_acceptance_guaranteed':False,
+           'research_decision':'Interpret proof strength and literature separately; CI PASS alone is not originality proof.'}
+          (out/'summary.json').write_text(json.dumps(result,indent=2))
+          print(json.dumps({'status':state,'stages':stages,'missing':missing,'failed':failed}))
+          PY
+      - name: Upload complete evidence even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSEM_Final_GitHub_Referee_Evidence
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
