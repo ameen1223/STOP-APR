@@ -1,0 +1,99 @@
+name: QSEM Gate04 Prometheus Float64 Boundary Regression
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  numerical-fidelity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Create independent precision fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          cases={
+           'one_ulp': {'phi':'0.9','threshold':'0.009','expected':1,
+                       'counts':{'0.005':50,'0.01':100,'0.025':100,'+Inf':100},
+                       'old_world':'50 rounded 0 ms, 50 rounded 6 ms; old sum=300 ms',
+                       'old_certificate':'CERTIFIED_CLEAR'},
+           'empty_gap_rank': {'phi':'0.14','threshold':'0.007','expected':1,
+                       'counts':{'0.005':3346,'0.01':3346,'0.025':23900,'+Inf':23900},
+                       'old_world':'3346 rounded 0 ms, 20554 rounded 11 ms; old sum=226094 ms',
+                       'old_certificate':'CERTIFIED_CLEAR'},
+           'control_fire': {'phi':'0.9','threshold':'0.007','expected':1,
+                       'counts':{'0.005':50,'0.01':50,'0.025':100,'+Inf':100},
+                       'old_world':'50 rounded 0 ms, 50 rounded 11 ms',
+                       'old_certificate':'CERTIFIED_FIRE'},
+           'control_clear': {'phi':'0.9','threshold':'0.007','expected':0,
+                       'counts':{'0.005':90,'0.01':100,'0.025':100,'+Inf':100},
+                       'old_world':'90 rounded 0 ms, 10 rounded 6 ms',
+                       'old_certificate':'CERTIFIED_CLEAR'}
+          }
+          lines=['rule_files: []','evaluation_interval: 1m','tests:','- interval: 1m','  input_series:']
+          for name,case in cases.items():
+              for le, count in case['counts'].items():
+                  lines+=['  - series: \'qsem_numeric_bucket{scenario="'+name+'",le="'+le+'"}\'',
+                          "    values: '"+str(count)+' '+str(count)+"'"]
+          lines+=['  promql_expr_test:']
+          for name,case in cases.items():
+              expr='histogram_quantile('+case['phi']+', qsem_numeric_bucket{scenario="'+name+'"}) > bool '+case['threshold']
+              lines+=['  - expr: \''+expr+'\'','    eval_time: 1m','    exp_samples:',
+                      '    - labels: \'{scenario="'+name+'"}\'',
+                      '      value: '+str(case['expected'])]
+          Path('out/promql_precision_test.yml').write_text('\n'.join(lines)+'\n')
+          Path('out/precision_manifest.json').write_text(json.dumps({
+            'scope':'Static classic histogram_quantile, direct PromQL vector: no rate or resets',
+            'purpose':'Falsify mathematical Q-SEM CERTIFIED_CLEAR at machine binary64 boundaries',
+            'cases':cases,
+            'old_certificate_labels':'As reproduced locally from SHA256-verified Gate03 source',
+            'not_executed_here':'Any production scrape, OTel instrumentation, or rate window',
+          },indent=2))
+          print('FOUR_STATIC_PRECISION_FIXTURES_READY')
+          PY
+      - name: Download pinned official Prometheus promtool
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            -o prometheus.tar.gz https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.linux-amd64.tar.gz 2>&1 | tee out/download.log
+          echo "6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84  prometheus.tar.gz" | sha256sum -c - | tee out/download_sha256.log
+          tar -xzf prometheus.tar.gz prometheus-3.15.1.linux-amd64/promtool
+          mv prometheus-3.15.1.linux-amd64/promtool ./promtool
+          chmod +x ./promtool
+          ./promtool --version | tee out/promtool_version.txt
+      - name: Run actual Prometheus numerical boundary tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./promtool test rules out/promql_precision_test.yml 2>&1 | tee out/promtool_precision_test.log
+      - name: Summarize status
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          out=Path('out');out.mkdir(exist_ok=True)
+          has_test=(out/'promtool_precision_test.log').exists()
+          text=(out/'promtool_precision_test.log').read_text() if has_test else ''
+          status='PASS' if ('SUCCESS' in text and 'FAILED' not in text) else 'INCOMPLETE_OR_FAILED'
+          (out/'summary.json').write_text(json.dumps({'status':status,
+            'numerical_boundary_fixtures':4,
+            'promtool_output_exists':has_test,
+            'is_original_gate03_rerun':False,
+            'scientific_limit':'only static histogram_quantile float64 numerical boundary; no rate/reset generality'},indent=2))
+          print(status)
+          PY
+      - name: Upload precision evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSEM_Gate04_Precision_Evidence
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
