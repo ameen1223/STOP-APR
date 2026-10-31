@@ -1,0 +1,827 @@
+name: QSEM Final Guarded PromQL Rate Bridge
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Go 1.23.2
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.2'
+      - name: Restore hashed sources without checkout or edits
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > rounding_certificate.py <<'QSEM_END_ROUNDING_CERTIFICATE_PY_LOCK'
+          #!/usr/bin/env python3
+          """Q-SEM exact restricted certificates for legacy integer-ms HTTP duration histograms.
+          
+          Scope:
+            - Legacy old observations: Python round(t_seconds*1000), clamped at 0.
+            - All t >= 0, no NaNs; bucket boundaries in integral milliseconds.
+            - Old histogram count, cumulative counts, and integer rounded _sum known.
+            - New histogram records full precision seconds and uses positive old boundaries
+              converted from milliseconds, omitting the old zero boundary.
+            - Prometheus *classic histogram* quantile, no native histograms, no resets,
+              label changes, server-side reaggregation, scrape gaps or rate extrapolation.
+          
+          For a threshold between target bucket edges b_i and b_{i+1}, only the number of
+          legacy observations exactly rounded to these two edges that cross to the next
+          bucket changes the linearly interpolated CDF at that threshold. A global
+          integer-sum budget constrains their maximal number. Thus a two-variable
+          bounded knapsack, solved exactly by residue arithmetic, suffices for a sound
+          fixed-threshold alert certificate without reconstructing all observations.
+          
+          This is a research prototype, NOT a complete PromQL translation/certifier.
+          """
+          from __future__ import annotations
+          from dataclasses import dataclass
+          from fractions import Fraction
+          from math import gcd
+          from typing import Optional
+          import json
+          
+          
+          def fq(v):
+              if isinstance(v, Fraction):return v
+              return Fraction(str(v))
+          
+          
+          def _pair_opt(costs, caps, weights, budget):
+              """Max w_i*z_i for <=2 bounded integer items; period-class exact search.
+          
+              Costs/weights/caps are nonnegative. Residue classes cut a constant-slope
+              objective between saturation points of the other item, so endpoint checks
+              suffice. Complexity O(min(c1,c2)/gcd(c1,c2)) in 2-item case independent of
+              the number of observations.
+              """
+              if not costs:return Fraction(0), []
+              assert all(isinstance(c,int) and c>=0 for c in costs)
+              assert all(isinstance(n,int) and n>=0 for n in caps)
+              assert budget>=0 and len(costs)==len(weights)==len(caps) and len(costs)<=2
+              if len(costs)==1:
+                  c=costs[0];n=caps[0]
+                  x=n if c==0 else min(n,budget//c)
+                  return weights[0]*x,[x]
+              a,b=costs;A,B=caps;wa,wb=weights
+              if a==0 or b==0:
+                  if a==0:
+                      z0=A;z1=B if b==0 else min(B,budget//b)
+                  else:
+                      z1=B;z0=min(A,budget//a)
+                  return wa*z0+wb*z1,[z0,z1]
+              swap = a<b  # enumerate larger-cost item, with smaller-cost residue period
+              if swap: a,b=b,a;A,B=B,A;wa,wb=wb,wa
+              xmax=min(A,budget//a)
+              P=b//gcd(a,b)
+              border=(budget-b*B)//a # x at or below this implies y saturated
+              best_val=Fraction(-1);best=None
+              for r in range(min(xmax+1,P)):
+                  kmax=(xmax-r)//P
+                  def last_le(bound):
+                      k=min(kmax,(bound-r)//P)
+                      if k>=0:return r+k*P
+                      return None
+                  opts=[r,r+kmax*P]
+                  cap=last_le(border)
+                  if cap is not None:
+                      opts.append(cap)
+                      if cap+P<=xmax: opts.append(cap+P)
+                  else:
+                      opts.append(r)
+                  for x in set(opts):
+                      if x<0 or x>xmax:continue
+                      y=min(B,(budget-a*x)//b)
+                      val=wa*x+wb*y
+                      if val>best_val or (val==best_val and (best is None or (x,y)<best)):
+                          best_val=val;best=(x,y)
+              assert best is not None
+              xs=list(best[::-1] if swap else best)
+              return best_val,xs
+          
+          
+          @dataclass(frozen=True)
+          class OldHistogram:
+              bounds_ms:tuple[int,...]  # includes zero; excludes +Inf
+              cumulative:tuple[int,...]
+              count:int
+              sum_rounded_ms:int
+          
+              def validate(self):
+                  b=self.bounds_ms;c=self.cumulative
+                  if not (len(b)>=3 and len(b)==len(c) and b[0]==0 and
+                      all(x>=0 for x in b) and all(x<y for x,y in zip(b,b[1:])) and
+                      all(isinstance(x,int) for x in b+c+(self.count,self.sum_rounded_ms)) and
+                      all(0<=x<=y for x,y in zip((0,)+c,c+(self.count,))) and
+                      self.sum_rounded_ms>=0):
+                      raise ValueError('INVALID_HISTOGRAM')
+                  ns=[c[0]]+[c[i]-c[i-1] for i in range(1,len(c))]+[self.count-c[-1]]
+                  lo=[0]+[b[i-1]+1 for i in range(1,len(b))]+[b[-1]+1]
+                  base=sum(n*k for n,k in zip(ns,lo))
+                  maxsum=sum(n*upper for n,upper in zip(ns[:-1],b))
+                  if self.sum_rounded_ms < base or (not ns[-1] and self.sum_rounded_ms>maxsum):
+                      raise ValueError('OLD_SUM_INCONSISTENT_WITH_BUCKETS')
+                  return ns,lo,base
+          
+          
+          def _new_q(phi, bound_ms, new_cumulative, count):
+              """Analytical classic Prom histogram quantile (supported nonnegative subset)."""
+              r=fq(phi)*count
+              prev_count=0;prev_bound=0
+              for b,c in zip(bound_ms,new_cumulative):
+                  if r<=c:
+                      if c<=prev_count:return fq(b)
+                      return fq(prev_bound)+fq(b-prev_bound)*(r-prev_count)/(c-prev_count)
+                  prev_count=c;prev_bound=b
+              return Fraction(bound_ms[-1]) # +Inf bucket -> second-highest finite edge
+          
+          
+          def certify(old:OldHistogram,phi,threshold_ms):
+              ns,lo,minsum=old.validate()
+              p=fq(phi);T=fq(threshold_ms)
+              if not (0<p<1):raise ValueError('PHI_OUTSIDE_RESTRICTED_RANGE')
+              if old.count==0:return {'status':'UNSUPPORTED','reason':'EMPTY_HISTOGRAM'}
+              b=old.bounds_ms[1:];cum=old.cumulative[1:]
+              if T<0:return {'status':'CERTIFIED_FIRE','reason':'NONNEGATIVE_DURATION'}
+              if T>=b[-1]:return {'status':'CERTIFIED_CLEAR','reason':'PROMETHEUS_FINITE_TOP_BUCKET'}
+              right=next(i for i,x in enumerate(b) if T<=x)
+              if right==0:
+                  left_bound=0;left_cum=0
+                  active=[right+1] # old index 1 is first positive bound
+                  weights=[T/b[0]] # wrong: weight at first bound is alpha=T/b; use fraction below
+                  weights=[T/fq(b[0])]
+                  nominal=weights[0]*cum[0]
+              else:
+                  low=b[right-1];high=b[right]
+                  alpha=(T-low)/fq(high-low)
+                  nominal=(1-alpha)*cum[right-1]+alpha*cum[right]
+                  active=[right,right+1] # indexes in legacy histogram
+                  weights=[1-alpha,alpha]
+              # Counts exactly on right legacy edge can move into next target bin;
+              # their minimum cost relative to leftmost rounded ms in that old bin.
+              costs=[old.bounds_ms[i]-lo[i] for i in active]
+              caps=[ns[i] for i in active]
+              budget=old.sum_rounded_ms-minsum
+              maxloss,chosen=_pair_opt(costs,caps,weights,budget)
+              worst=nominal-maxloss
+              rank=p*old.count
+              if nominal<rank: status='CERTIFIED_FIRE'
+              elif worst>=rank: status='CERTIFIED_CLEAR'
+              else: status='UNDECIDABLE'
+              return {'status':status,'threshold_ms':str(T),'phi':str(p),
+                      'count':old.count,'rank':str(rank),'nominal_interpolated_cdf':str(nominal),
+                      'minimal_interpolated_cdf':str(worst),'max_weighted_loss':str(maxloss),
+                      'sum_budget_over_bucket_minima':budget,
+                      'active_old_bounds_ms':[old.bounds_ms[i] for i in active],
+                      'max_loss_moved_counts':chosen,
+                      'model':'NONNEGATIVE_PYTHON_INTEGER_MS_ROUND_TO_FULL_PRECISION_SECONDS;CLASSIC_HISTOGRAM;STATIC_EXACT_COUNTS',
+                      'proof':'quantile_gt_threshold iff linearly-interpolated-CDF_at_threshold < phi*N; old bucket boundary k may migrate only when unrounded t>k; rounded integer sum limits boundary mass'}
+          
+          
+          def old_from_ms(values, bounds=(0,5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000)):
+              vals=[round(v) for v in values]
+              assert all(v>=0 and isinstance(v,int) for v in vals)
+              return OldHistogram(tuple(bounds),tuple(sum(k<=e for k in vals) for e in bounds),len(vals),sum(vals))
+          
+          
+          def target_from_events_ms(events,bounds):
+              positives=bounds[1:]
+              return [sum(v<=e for v in events) for e in positives]
+          
+          
+          def run_samples():
+              b=(0,5,10,25,50,75,100,250,500,750,1000,2500,5000,7500,10000)
+              examples=[]
+              for name,events,threshold in [
+                  ('identical_4p6',[4.6]*100,7),
+                  ('identical_5p4',[5.4]*100,7),
+                  ('identical_1p2',[1.2]*100,7),
+                  ('identical_4p0',[4.0]*100,7),
+                  ('identical_0p0',[0.0]*100,7),
+                  ('mixed_low',[1.2]*96+[4.9]*4,7),
+              ]:
+                  old=old_from_ms(events,b)
+                  cert=certify(old,Fraction(95,100),threshold)
+                  newer=target_from_events_ms(events,b)
+                  quantile=_new_q(Fraction(95,100),b[1:],newer,len(events))
+                  actual=quantile>threshold
+                  predicts={'CERTIFIED_FIRE':True,'CERTIFIED_CLEAR':False}.get(cert['status'])
+                  if predicts is not None: assert predicts==actual,(name,cert,float(quantile))
+                  examples.append({'case':name,'new_p95_ms':str(quantile),'alert':actual,
+                                   'certificate':cert['status'],'max_loss_moved_counts':cert.get('max_loss_moved_counts')})
+              return examples
+          
+          if __name__=='__main__':
+              print(json.dumps(run_samples(),indent=2))
+          QSEM_END_ROUNDING_CERTIFICATE_PY_LOCK
+          cat > active_bucket_certificate.py <<'QSEM_END_ACTIVE_BUCKET_CERTIFICATE_PY_LOCK'
+          """Exact 0/1/2 new-bucket counter sufficiency under static ideal histogram model.
+          
+          Proof sketch: at fixed T, alert iff w1*z1+w2*z2 > gamma. The feasible
+          (z1,z2) are EXACTLY the box intersected with a single integer-sum knapsack.
+          No new counter needed if gamma outside that loss interval; if ambiguous,
+          querying z1 alone is sufficient iff there is no feasible pair with
+          w1*z1 <= gamma < w1*z1+w2*z2. This is checked by optimizing with z1's cap
+          reduced to floor(gamma/w1), using the original exact 2-item optimizer.
+          Equivalent test for querying z2. Two adjacent new cumulative counts always
+          suffice. Minimality is information-theoretic for deterministic queries that
+          retrieve existing NEW *bucket cumulative counts*, not arbitrary sketches.
+          
+          This file concerns exact rational interpolation; floating point corrections
+          and PromQL rate windows are outside the theorem.
+          """
+          from fractions import Fraction
+          from rounding_certificate import OldHistogram, _pair_opt, fq
+          
+          
+          def optimal_bucket_probes(old:OldHistogram,phi,T):
+              ns,lo,base=old.validate()
+              p=fq(phi);T=fq(T);N=old.count
+              if not 0<p<1 or N<1:return {'status':'UNSUPPORTED'}
+              B=old.bounds_ms
+              if T<0:return {'status':'CERTIFIED_FIRE','min_queries':0}
+              if T>=B[-1]:return {'status':'CERTIFIED_CLEAR','min_queries':0}
+              cum=old.cumulative[1:];edges=B[1:]
+              j=next(i for i,e in enumerate(edges) if T<=e)
+              if j==0:
+                  alpha=T/fq(edges[0])
+                  nominal=alpha*cum[0]
+                  old_j=[1];w=[alpha];new_j=[0]
+              else:
+                  low=edges[j-1];up=edges[j]
+                  alpha=(T-low)/fq(up-low)
+                  nominal=(1-alpha)*cum[j-1]+alpha*cum[j]
+                  old_j=[j,j+1];w=[1-alpha,alpha];new_j=[j-1,j]
+              costs=[B[i]-lo[i] for i in old_j]
+              caps=[ns[i] for i in old_j]
+              budget=old.sum_rounded_ms-base
+              gamma=nominal-p*N
+              if gamma<0:return {'status':'CERTIFIED_FIRE','min_queries':0}
+              mx,optimal_moves=_pair_opt(costs,caps,w,budget)
+              if mx<=gamma:return {'status':'CERTIFIED_CLEAR','min_queries':0}
+              if len(old_j)==1:
+                  return {'status':'UNDECIDABLE','min_queries':1,
+                          'sufficient_new_counter_edges_ms':[edges[j]],'two_counter_bound':1,
+                          'max_loss_moves':dict(zip([B[i] for i in old_j],optimal_moves))}
+              singleton=[]
+              ambiguities=[]
+              for fixed_index in (0,1):
+                  caps2=caps[:]
+                  if w[fixed_index]>0:
+                      caps2[fixed_index]=min(caps2[fixed_index],int(gamma//w[fixed_index]))
+                  # Any feasible configuration reaching FIRE while a fixed observed
+                  # count alone remains in the CLEAR region yields two source-compatible
+                  # worlds with the same observed new counter and opposite decisions.
+                  feasible_max,violating_pair=_pair_opt(costs,caps2,w,budget)
+                  if feasible_max<=gamma:
+                      singleton.append(edges[new_j[fixed_index]])
+                  else:
+                      ambiguities.append({'queried_edge_ms':edges[new_j[fixed_index]],
+                                          'shared_counter_moves':violating_pair[fixed_index],
+                                          'two_possible_fates':True})
+              return {'status':'UNDECIDABLE','min_queries':1 if singleton else 2,
+                      'sufficient_new_counter_edges_ms':singleton,
+                      'two_counter_edges_ms':[edges[i] for i in new_j],
+                      'exclusion_witnesses':ambiguities,
+                      'max_loss_moves':dict(zip([B[i] for i in old_j],optimal_moves)),
+                      'gamma':str(gamma)}
+          QSEM_END_ACTIVE_BUCKET_CERTIFICATE_PY_LOCK
+          cat > rate_bridge_guard.py <<'QSEM_END_RATE_BRIDGE_GUARD_PY_LOCK'
+          """Restricted Prometheus-3.15.1 classic histogram rate-to-static bridge.
+          
+          Only the ideal-arithmetic structural reduction is proved. This code NEVER
+          certifies floating-point PromQL output or arbitrary rate() range semantics.
+          The paired-origin and no-reset facts MUST be externally attested, not guessed
+          from old histogram counters alone.
+          """
+          from dataclasses import dataclass
+          from fractions import Fraction
+          from rounding_certificate import OldHistogram, certify
+          from active_bucket_certificate import optimal_bucket_probes
+          
+          
+          def as_f(x):
+              return x if isinstance(x, Fraction) else Fraction(str(x))
+          
+          
+          @dataclass(frozen=True)
+          class RateWindow:
+              old_start: OldHistogram
+              old_end: OldHistogram
+              observed_new_first_cumulative: tuple[int, ...] | None
+              range_start_s: int
+              sample_start_s: int
+              sample_end_s: int
+              range_end_s: int
+              paired_zero_origin_attested: bool
+              target_timestamps_matched: bool
+              no_reset_attested: bool
+              classic_float_counters_only: bool
+              single_label_group: bool
+              no_gaps_or_extra_samples: bool
+              no_promql_transform_except_rate_sum_quantile: bool
+              integer_sum_exact_attested: bool
+          
+          
+          def _failure(reason):
+              return {"status": "UNSUPPORTED", "reason": reason,
+                      "engine_alert_certificate": False}
+          
+          
+          def check_rate_bridge(win: RateWindow, phi, threshold_ms):
+              """Sufficient condition for a *real-arithmetic* common-factor reduction.
+          
+              If all target cumulative bucket counters start at 0 and two scrape samples
+              are aligned, every positive rate increment has the same extrapolation factor.
+              A zero increment remains zero even if its extrapolation factor is different.
+              The first=0 claim for new counters follows from the *attested* paired origin,
+              not from merely looking at an old histogram with count=0.
+              """
+              checks = (
+                  (win.paired_zero_origin_attested, "UNVERIFIED_PAIRED_ZERO_ORIGIN"),
+                  (win.target_timestamps_matched, "TARGET_SCRAPES_NOT_VERIFIED_ALIGNED"),
+                  (win.no_reset_attested, "RESETS_NOT_EXCLUDED"),
+                  (win.classic_float_counters_only, "UNSUPPORTED_COUNTER_TYPE"),
+                  (win.single_label_group, "MIXED_OR_AGGREGATED_LABEL_GROUP"),
+                  (win.no_gaps_or_extra_samples, "SAMPLE_SET_NOT_EXACTLY_TWO"),
+                  (win.no_promql_transform_except_rate_sum_quantile, "UNSUPPORTED_PROMQL_TRANSFORM"),
+                  (win.integer_sum_exact_attested, "LEGACY_SUM_EXACTNESS_NOT_ATTESTED"),
+              )
+              for ok, why in checks:
+                  if not ok:
+                      return _failure(why)
+              if not all(isinstance(t, int) for t in (
+                  win.range_start_s, win.sample_start_s, win.sample_end_s, win.range_end_s
+              )):
+                  return _failure("NONINTEGER_TIME_GRID")
+              a, t0, t1, b = (win.range_start_s, win.sample_start_s,
+                              win.sample_end_s, win.range_end_s)
+              if not (a < t0 < t1 <= b and b > a):
+                  return _failure("INVALID_RANGE_OR_SCRAPE_TIMESTAMPS")
+              if win.old_start.bounds_ms != win.old_end.bounds_ms:
+                  return _failure("BUCKET_LAYOUT_CHANGED")
+              # Optional check when the fresh-start target scrape is already available.
+              # Its absence does not add a new probe: zero target origin is then inferred
+              # from zero old origin PLUS the independently attested paired-event origin.
+              if win.observed_new_first_cumulative is not None:
+                  if (len(win.observed_new_first_cumulative) != len(win.old_end.bounds_ms) or
+                          any(not isinstance(x,int) or x!=0 for x in win.observed_new_first_cumulative)):
+                      return _failure("NEW_FIRST_CUMULATIVE_COUNTERS_NOT_OBSERVED_ZERO")
+              if any(x != 0 for x in win.old_start.cumulative) or (
+                      win.old_start.count != 0 or win.old_start.sum_rounded_ms != 0):
+                  return _failure("FIRST_LEGACY_HISTOGRAM_NOT_ZERO")
+              try:
+                  win.old_start.validate()
+                  win.old_end.validate()
+              except ValueError:
+                  return _failure("INVALID_OLD_HISTOGRAM")
+              if win.old_end.count <= 0:
+                  return _failure("NO_EVENTS_IN_WINDOW")
+              if (win.old_end.count > 2**53 or
+                      win.old_end.sum_rounded_ms > 2**53):
+                  return _failure("INTEGER_COUNTER_PRECISION_NOT_ESTABLISHED")
+          
+              # Pinned extrapolatedRate: with initial 0, first/positive-increase ratio is
+              # 0, so durationToStart is 0. All cumulative positive increments share a.
+              span = t1 - t0
+              until_end = b - t1
+              # The comparison is exact; Go's 1.1 floating threshold is irrelevant to
+              # the tested time grids, which stay away from the equality boundary.
+              if 10 * until_end >= 11 * span:
+                  until_end = Fraction(span, 2)
+              scale = (as_f(span) + as_f(until_end)) / (as_f(span) * (b - a))
+          
+              actual = certify(win.old_end, phi, threshold_ms)
+              active = optimal_bucket_probes(win.old_end, phi, threshold_ms)
+              if actual["status"] != active["status"]:
+                  raise AssertionError("FROZEN_CERTIFICATE_DISAGREEMENT")
+              return {
+                  "status": "IDEAL_RATE_BRIDGE_PROVED",
+                  "real_arithmetic_common_rate_factor": str(scale),
+                  "static_certificate_status": actual["status"],
+                  "information_min_new_counters": active["min_queries"],
+                  "sufficient_new_counter_edges_ms": active.get("sufficient_new_counter_edges_ms", []),
+                  "guard_explanation": "paired old origin zero implies target origin zero; aligned reset-free two-scrape classic counters",
+                  "counter_acquisition_accounting": "0/1/2 target last-scrape reads conditional on separately verified provenance and synchronized baseline metadata",
+                  "scope": "static-interval Q-SEM theorem transfers to rate() only under real arithmetic",
+                  "engine_alert_certificate": False,
+                  "float64_and_monotonicity_repair_unproved": True,
+              }
+          QSEM_END_RATE_BRIDGE_GUARD_PY_LOCK
+          cat > rate_bridge_audit.py <<'QSEM_END_RATE_BRIDGE_AUDIT_PY_LOCK'
+          """Independent local checks for the final constrained rate-to-static bridge."""
+          import json
+          import random
+          from dataclasses import replace
+          from fractions import Fraction
+          from pathlib import Path
+          from rate_bridge_guard import RateWindow, check_rate_bridge
+          from rounding_certificate import (old_from_ms, target_from_events_ms,
+                                            certify, _new_q)
+          
+          B = (0, 5, 10, 25, 50, 75, 100, 250, 500, 1000)
+          rng = random.Random(31102026)
+          
+          
+          def window(events, **kw):
+              old = old_from_ms([round(x) for x in events], B)
+              empty = old_from_ms([], B)
+              flags = dict(paired_zero_origin_attested=True,
+                           target_timestamps_matched=True, no_reset_attested=True,
+                           classic_float_counters_only=True, single_label_group=True,
+                           no_gaps_or_extra_samples=True,
+                           no_promql_transform_except_rate_sum_quantile=True,
+                           integer_sum_exact_attested=True)
+              flags.update(kw)
+              return RateWindow(empty, old, (0,)*len(B), 0, 10, 60, 60, **flags)
+          
+          
+          def rate_q_exact(phi, bounds, cumulative, factor, N):
+              """Independent ideal quantile with scaled bucket counts (no call to _new_q)."""
+              rank = Fraction(str(phi)) * N * factor
+              lower = 0
+              prior = Fraction(0)
+              for e, c in zip(bounds, cumulative):
+                  upper = factor * c
+                  if rank <= upper:
+                      if upper == prior:
+                          return Fraction(e)
+                      return Fraction(lower) + Fraction(e-lower) * (rank-prior) / (upper-prior)
+                  prior = upper
+                  lower = e
+              return Fraction(bounds[-1])
+          
+          
+          def run(outdir="out"):
+              Path(outdir).mkdir(exist_ok=True, parents=True)
+              cases = [
+                  ("safe_clear", [1.2] * 100, Fraction(95, 100), 7),
+                  ("safe_fire", [5.8] * 100, Fraction(95, 100), 7),
+                  ("ambiguous_low", [4.6] * 100, Fraction(95, 100), 7),
+                  ("ambiguous_high", [5.4] * 100, Fraction(95, 100), 7),
+              ]
+              verified = []
+              for title, events, phi, T in cases:
+                  w = window(events)
+                  result = check_rate_bridge(w, phi, T)
+                  assert result['status'] == 'IDEAL_RATE_BRIDGE_PROVED'
+                  observed = _new_q(phi, B[1:], target_from_events_ms(events, B), len(events))
+                  rate_observed = rate_q_exact(phi, B[1:], target_from_events_ms(events, B),
+                                               Fraction(result['real_arithmetic_common_rate_factor']), len(events))
+                  assert observed == rate_observed
+                  status = result['static_certificate_status']
+                  if status == 'CERTIFIED_FIRE':
+                      assert observed > T
+                  elif status == 'CERTIFIED_CLEAR':
+                      assert observed <= T
+                  verified.append(dict(case=title, certificate=status,
+                                       q_ms=str(observed), rate_q_ms=str(rate_observed),
+                                       rate_factor=result['real_arithmetic_common_rate_factor'],
+                                       min_counters=result['information_min_new_counters']))
+              assert verified[0]['certificate'] == 'CERTIFIED_CLEAR'
+              assert verified[1]['certificate'] == 'CERTIFIED_FIRE'
+              assert all(c['certificate'] == 'UNDECIDABLE' for c in verified[2:])
+          
+              refusal_conditions = (
+                  ('paired_zero_origin_attested','UNVERIFIED_PAIRED_ZERO_ORIGIN'),
+                  ('target_timestamps_matched','TARGET_SCRAPES_NOT_VERIFIED_ALIGNED'),
+                  ('no_reset_attested','RESETS_NOT_EXCLUDED'),
+                  ('classic_float_counters_only','UNSUPPORTED_COUNTER_TYPE'),
+                  ('single_label_group','MIXED_OR_AGGREGATED_LABEL_GROUP'),
+                  ('no_gaps_or_extra_samples','SAMPLE_SET_NOT_EXACTLY_TWO'),
+                  ('no_promql_transform_except_rate_sum_quantile','UNSUPPORTED_PROMQL_TRANSFORM'),
+                  ('integer_sum_exact_attested','LEGACY_SUM_EXACTNESS_NOT_ATTESTED'),
+              )
+              for field, reason in refusal_conditions:
+                  r = check_rate_bridge(window([5.8]*100, **{field: False}), .95, 7)
+                  assert r['status']=='UNSUPPORTED' and r['reason']==reason
+              nonzero = replace(window([1.2]*100), old_start=old_from_ms([5.8]*100,B))
+              assert check_rate_bridge(nonzero, .95, 7)['reason']=='FIRST_LEGACY_HISTOGRAM_NOT_ZERO'
+              target_first_bad = replace(window([1.2]*100),
+                                         observed_new_first_cumulative=(0,)*9+(1,))
+              assert check_rate_bridge(target_first_bad,.95,7)['reason']=='NEW_FIRST_CUMULATIVE_COUNTERS_NOT_OBSERVED_ZERO'
+              no_target_first_read = replace(window([1.2]*100), observed_new_first_cumulative=None)
+              assert check_rate_bridge(no_target_first_read, .95,7)['status']=='IDEAL_RATE_BRIDGE_PROVED'
+              t_invalid = replace(window([1.2]*100), sample_start_s=0)
+              assert check_rate_bridge(t_invalid, .95, 7)['reason']=='INVALID_RANGE_OR_SCRAPE_TIMESTAMPS'
+          
+              # Source-level unequal-factor counterexample: both interval deltas are 1,
+              # but the lower first value is 0 and the upper first value is 100.
+              static_q = Fraction(19, 4)     # P95=4.75 ms, CLEAR against 7ms
+              rate_lower = Fraction(1,60)
+              rate_upper = Fraction(1,50)
+              rate_rank = Fraction(95,100)*rate_upper
+              rate_q = 5+5*(rate_rank-rate_lower)/(rate_upper-rate_lower)
+              assert rate_q == Fraction(17,2) and static_q < 7 < rate_q
+          
+              total = 0
+              clear = fire = unknown = 0
+              for _ in range(4000):
+                  n = rng.randrange(1,100)
+                  events = [rng.choice([0,1.2,2.4,4.6,5.4,5.8,6.3,9.6,10.4,24.6,25.4,
+                                       49.9,50.1,90.5,200.3]) for _ in range(n)]
+                  phi = rng.choice([Fraction(1,2),Fraction(9,10),Fraction(19,20),Fraction(99,100)])
+                  T = rng.choice([1,4,5,7,10,12,25,50,100,200])
+                  w = window(events)
+                  result = check_rate_bridge(w,phi,T)
+                  assert result['status']=='IDEAL_RATE_BRIDGE_PROVED'
+                  newer = target_from_events_ms(events,B)
+                  factor = Fraction(result['real_arithmetic_common_rate_factor'])
+                  q0 = _new_q(phi,B[1:],newer,n)
+                  qrate = rate_q_exact(phi,B[1:],newer,factor,n)
+                  assert q0==qrate,(q0,qrate,events,phi)
+                  if result['static_certificate_status']=='CERTIFIED_FIRE':
+                      assert qrate>T
+                      fire+=1
+                  elif result['static_certificate_status']=='CERTIFIED_CLEAR':
+                      assert qrate<=T
+                      clear+=1
+                  else:
+                      unknown+=1
+                  total+=1
+              report = {
+                  'status':'PASS','mode':'exact rational, synthetic events, not live Prometheus',
+                  'source_revision':'Prometheus v3.15.1','positive_named_cases':verified,
+                  'random_paired_ideal_decisions':total,
+                  'classified':{'fire':fire,'clear':clear,'undecidable':unknown},
+                  'negative_unequal_factor_static_q_ms':str(static_q),
+                  'negative_unequal_factor_rate_q_ms':str(rate_q),
+                  'refused_precondition_flags':len(refusal_conditions),
+                  'additional_zero_start_refusals':3,
+                  'attested_old_zero_origin_without_new_baseline_read':True,
+                  'float64_guarantee':False,
+                  'unverified_dependencies':['actual_promtool fixtures','real-world paired zero-origin frequency']
+              }
+              Path(outdir,'rate_bridge_local_audit.json').write_text(json.dumps(report,indent=2))
+              print(json.dumps(report,indent=2))
+              return report
+          
+          
+          if __name__=='__main__':
+              run()
+          QSEM_END_RATE_BRIDGE_AUDIT_PY_LOCK
+          cat > rate_bridge_independent.go <<'QSEM_END_RATE_BRIDGE_INDEPENDENT_GO_LOCK'
+          // Independent float64 replay of the pinned Prometheus v3.15.1 extrapolatedRate
+          // arithmetic for classic float counter series; no Prometheus engine linked.
+          package main
+          import (
+            "encoding/json"
+            "fmt"
+            "math"
+            "math/rand"
+            "os"
+          )
+          func rate(first,last,start,firstT,lastT,end float64) float64 {
+            inc:=last-first
+            span:=lastT-firstT
+            toStart:=firstT-start
+            toEnd:=end-lastT
+            threshold:=span*1.1
+            if toStart >= threshold {toStart=span/2}
+            if inc>0 && first>=0 {
+              zeroAt:=span*(first/inc)
+              if zeroAt<toStart {toStart=zeroAt}
+            }
+            if toEnd >= threshold {toEnd=span/2}
+            factor:=(span+toStart+toEnd)/span/(end-start)
+            return inc*factor
+          }
+          func quantile(q float64, edges, cumul []float64) float64 {
+            rank:=q*cumul[len(cumul)-1]
+            prev:=0.0
+            low:=0.0
+            for i,c:=range cumul[:len(cumul)-1] {
+              if c>=rank {
+                if c==prev {return edges[i]}
+                return low+(edges[i]-low)*(rank-prev)/(c-prev)
+              }
+              prev=c;low=edges[i]
+            }
+            return edges[len(edges)-1]
+          }
+          func almost(a,b float64) bool {return math.Abs(a-b)<1e-11}
+          func main(){
+            lower:=rate(0,1,0,10,60,60)
+            upFresh:=rate(0,1,0,10,60,60)
+            upHistory:=rate(100,101,0,10,60,60)
+            qFresh:=quantile(.95,[]float64{5,10},[]float64{lower,upFresh,upFresh})
+            qUnequal:=quantile(.95,[]float64{5,10},[]float64{lower,upHistory,upHistory})
+            if !almost(qFresh,4.75) || !almost(qUnequal,8.5) {panic(fmt.Sprintf("negative pair failed %v %v",qFresh,qUnequal))}
+            r:=rand.New(rand.NewSource(31102026))
+            n:=0
+            for i:=0;i<10000;i++ {
+              a:=r.Float64()*15
+              b:=a+1+r.Float64()*40
+              c:=b+r.Float64()*10
+              R:=c+r.Float64()*20
+              f:=math.NaN()
+              for j:=0;j<10;j++ {
+                delta:=float64(r.Intn(1000)+1)
+                observed:=rate(0,delta,0,a,b,R)
+                factor:=observed/delta
+                if j>0 && !almost(f,factor) {panic("noncommon factor for initially-zero counters")}
+                f=factor
+              }
+              n++
+            }
+            payload:=map[string]interface{}{
+              "status":"PASS", "source":"independent Go float64 arithmetic reproduction, not actual promtool",
+              "fresh_zero_origin_q95_ms":qFresh,
+              "unequal_origin_q95_ms":qUnequal,
+              "positive_rate_factor_common_random_windows":n,
+              "float64_promql_certificate_proven":false,
+            }
+            data,_:=json.MarshalIndent(payload,"","  ")
+            if err:=os.MkdirAll("out",0755);err!=nil{panic(err)}
+            if err:=os.WriteFile("out/rate_bridge_go_replay.json",data,0644);err!=nil{panic(err)}
+            fmt.Println(string(data))
+          }
+          QSEM_END_RATE_BRIDGE_INDEPENDENT_GO_LOCK
+          cat > generate_promql_fixture.py <<'QSEM_END_GENERATE_PROMQL_FIXTURE_PY_LOCK'
+          """Pinned v3.15.1 promtool test fixture with zero/nonzero first-count controls."""
+          import json
+          from pathlib import Path
+          from rounding_certificate import target_from_events_ms
+          
+          BOUNDS = (0,5,10,25,50,75,100,250,500,1000)
+          CASES = {
+              'safe_clear': ([1.2]*100, 0),
+              'safe_fire': ([5.8]*100, 1),
+              'ambiguous_low': ([4.6]*100, 0),
+              'ambiguous_high': ([5.4]*100, 1),
+          }
+          
+          
+          def series(name, case, edge, first, last):
+              # t0 is 10 s and t1 is 60 s in a [0,60] rate window.
+              # Six trailing grid positions use missing-sample notation, not zeroes.
+              limit = '+Inf' if edge is None else format(edge/1000,'.15g')
+              return {'series':f'{name}{{scenario="{case}",le="{limit}"}}',
+                      'values':f'_ {first} _ _ _ _ {last}'}
+          
+          
+          def output(path='out/promql_rate_bridge.yml'):
+              source = []
+              expected = []
+              summary = []
+              for name,(events,alert) in CASES.items():
+                  cumulative = target_from_events_ms(events,BOUNDS)
+                  for edge,n in list(zip(BOUNDS[1:],cumulative))+[(None,len(events))]:
+                      source.append(series('qsem_bridge_new_bucket',name,edge,0,n))
+                      source.append(series('qsem_static_delta_bucket',name,edge,n,n))
+                  expected.append({'labels':f'{{scenario="{name}"}}','value':alert})
+                  summary.append({'case':name,'count':len(events),'expected_rate_alert':alert})
+          
+              # Same delta in 'fresh_one' and 'unequal_old_origin'. Only starting
+              # population differs. Actual Prometheus must flip the decision.
+              negatives = {
+                  'fresh_one': ([(5,0,1),(10,0,1),(None,0,1)],0),
+                  'unequal_old_origin': ([(5,0,1),(10,100,101),(None,100,101)],1),
+              }
+              for name,(snapshots,alert) in negatives.items():
+                  for edge,start,end in snapshots:
+                      source.append(series('qsem_bridge_new_bucket',name,edge,start,end))
+                      source.append(series('qsem_static_delta_bucket',name,edge,end-start,end-start))
+                  summary.append({'case':name,'old_origin_zero':name=='fresh_one',
+                                  'expected_static_delta_alert':0,
+                                  'expected_rate_alert':alert})
+          
+              safe_expr=('histogram_quantile(0.95, sum by (scenario,le) '
+                         '(rate(qsem_bridge_new_bucket{scenario=~"safe_clear|safe_fire|ambiguous_low|ambiguous_high"}[60s]))) > bool 0.007')
+              pair_expr=('histogram_quantile(0.95, sum by (scenario,le) '
+                         '(rate(qsem_bridge_new_bucket{scenario=~"fresh_one|unequal_old_origin"}[60s]))) > bool 0.007')
+              static_pair=('histogram_quantile(0.95, qsem_static_delta_bucket{scenario=~"fresh_one|unequal_old_origin"}) > bool 0.007')
+              tests=[
+                  {'expr':safe_expr,'eval_time':'60s','exp_samples':expected},
+                  {'expr':pair_expr,'eval_time':'60s','exp_samples':[
+                      {'labels':'{scenario="fresh_one"}','value':0},
+                      {'labels':'{scenario="unequal_old_origin"}','value':1}]},
+                  {'expr':static_pair,'eval_time':'60s','exp_samples':[
+                      {'labels':'{scenario="fresh_one"}','value':0},
+                      {'labels':'{scenario="unequal_old_origin"}','value':0}]},
+              ]
+              fixture={'rule_files':[],'evaluation_interval':'1m',
+                       'tests':[{'interval':'10s','input_series':source,'promql_expr_test':tests}]}
+              Path(path).parent.mkdir(parents=True,exist_ok=True)
+              # JSON is a strict subset of YAML; Prometheus promtool YAML parser accepts it.
+              Path(path).write_text(json.dumps(fixture,indent=2))
+              report={'status':'READY_FOR_PROMTOOL','groups':len(summary),
+                      'promql_checks':len(tests),'sampled_scrapes':[10,60],
+                      'range_window_seconds':60, 'checks':summary,
+                      'negative_flip_expected':{'static':0,'rate':1},
+                      'real_engine_not_yet_executed':True}
+              Path('out/promql_rate_bridge_manifest.json').write_text(json.dumps(report,indent=2))
+              print(json.dumps({'groups':len(summary),'expressions':len(tests),
+                                'status':'READY_FOR_PROMTOOL'}))
+          
+          
+          if __name__=='__main__':
+              output()
+          QSEM_END_GENERATE_PROMQL_FIXTURE_PY_LOCK
+          python - <<'PY_SOURCE_VERIFY'
+          import hashlib, json
+          expected=json.loads('{"rounding_certificate.py": "fcd69b3c58dd24e6c5fea177fb3b8303d750659c2c4a009a65a96dee1caed311", "active_bucket_certificate.py": "de1caee64d869f6ae7ab753b94c1868b7cd710c16e88a61b946245511388d7a7", "rate_bridge_guard.py": "b510ecde5599257854f38b7eca726a80f8eb31131c364c42134a07d11d37ee17", "rate_bridge_audit.py": "121a762ba91f90e669121f5ff51ce50668ae897e17267bb5382f75aa57484493", "rate_bridge_independent.go": "f73a2ff20520e156696c32d720b53545ad0c95df5c4444b34912c2b2a288ae41", "generate_promql_fixture.py": "9f18695896250d10345c8fac556145c271152653855cd794c429fbb6a7231cfd"}')
+          for name,digest in expected.items():
+              actual=hashlib.sha256(open(name,'rb').read()).hexdigest()
+              assert actual==digest,(name,digest,actual)
+          open('out/source_hashes.json','w').write(json.dumps(expected,indent=2))
+          print('FROZEN_AND_NEW_SOURCE_HASHES_PASS')
+          PY_SOURCE_VERIFY
+          sha256sum rounding_certificate.py active_bucket_certificate.py rate_bridge_guard.py rate_bridge_audit.py rate_bridge_independent.go generate_promql_fixture.py > out/source_sha256.txt
+      - name: Independent offline proof and counterexamples
+        id: local
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile rounding_certificate.py active_bucket_certificate.py rate_bridge_guard.py rate_bridge_audit.py generate_promql_fixture.py
+          python rate_bridge_audit.py 2>&1 | tee out/rate_bridge_local_audit.log
+          go version > out/go_version.txt
+          go run rate_bridge_independent.go 2>&1 | tee out/rate_bridge_go.log
+          python generate_promql_fixture.py 2>&1 | tee out/promql_fixture_generation.log
+          python - <<'PY_LOCAL_QA'
+          import json
+          from pathlib import Path
+          p=json.loads(Path('out/rate_bridge_local_audit.json').read_text())
+          assert p['status']=='PASS' and p['random_paired_ideal_decisions']==4000
+          q=json.loads(Path('out/rate_bridge_go_replay.json').read_text())
+          assert q['status']=='PASS' and q['positive_rate_factor_common_random_windows']==10000
+          pql=json.loads(Path('out/promql_rate_bridge.yml').read_text())
+          assert len(pql['tests'][0]['promql_expr_test'])==3
+          assert len(pql['tests'][0]['input_series'])==92
+          assert 'unequal_old_origin' in Path('out/promql_rate_bridge.yml').read_text()
+          print('LOCAL_QA_PASS')
+          PY_LOCAL_QA
+      - name: Fetch checksum verified Prometheus 3.15.1 promtool
+        id: promdownload
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 -o prometheus.tar.gz \
+            https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.linux-amd64.tar.gz \
+            2>&1 | tee out/prometheus_download.log
+          echo "6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84  prometheus.tar.gz" | sha256sum -c - | tee out/prometheus_sha256_check.log
+          tar -xzf prometheus.tar.gz prometheus-3.15.1.linux-amd64/promtool
+          mv prometheus-3.15.1.linux-amd64/promtool ./promtool
+          chmod +x ./promtool
+          ./promtool --version 2>&1 | tee out/promtool_version.txt
+      - name: Execute actual PromQL rate bridge fixtures
+        id: promql
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s out/promql_rate_bridge.yml
+          ./promtool test rules out/promql_rate_bridge.yml 2>&1 | tee out/promtool_rate_bridge.log
+      - name: Final evidence summary
+        if: always()
+        shell: bash
+        env:
+          QSEM_STEP_RESTORE: ${{ steps.restore.outcome }}
+          QSEM_STEP_LOCAL: ${{ steps.local.outcome }}
+          QSEM_STEP_PROMDOWNLOAD: ${{ steps.promdownload.outcome }}
+          QSEM_STEP_PROMQL: ${{ steps.promql.outcome }}
+        run: |
+          python - <<'PY_FINAL_SUMMARY'
+          import os,json
+          from pathlib import Path
+          out=Path('out');out.mkdir(exist_ok=True)
+          stages={k.removeprefix('QSEM_STEP_').lower():v for k,v in os.environ.items() if k.startswith('QSEM_STEP_')}
+          required=['source_hashes.json','rate_bridge_local_audit.json','rate_bridge_go_replay.json',
+                    'promql_rate_bridge.yml','promql_rate_bridge_manifest.json',
+                    'promtool_version.txt','promtool_rate_bridge.log','prometheus_sha256_check.log']
+          missing=[x for x in required if not (out/x).exists() or (out/x).stat().st_size==0]
+          engine_ok = (out/'promtool_rate_bridge.log').exists() and 'SUCCESS' in (out/'promtool_rate_bridge.log').read_text()
+          prior=(out/'rate_bridge_local_audit.json').exists()
+          source_ok=(out/'source_hashes.json').exists()
+          local_status=json.loads((out/'rate_bridge_local_audit.json').read_text()) if prior else {}
+          status='PASS' if all(v=='success' for v in stages.values()) and len(stages)==4 and not missing and engine_ok and local_status.get('status')=='PASS' and source_ok else 'INCOMPLETE'
+          res={'status':status,'stage_outcomes':stages,'missing_artifacts':missing,
+               'actual_prometheus_3_15_1_engine_success':bool(engine_ok),
+               'promql_expression_checks':3 if engine_ok else None,
+               'ideal_arithmetic_random_paired_checks':local_status.get('random_paired_ideal_decisions'),
+               'go_source_formula_random_checks':10000 if (out/'rate_bridge_go_replay.json').exists() else None,
+               'theorem_scope':'restricted, exact-rational, paired-zero-origin, aligned two-scrape classic float-counter rate() with no resets or other transforms',
+               'frozen_gate01_06_reexecuted':False,
+               'prometheus_float64_general_soundness_proven':False,
+               'journal_originality_at_least_8_5_proven':False,
+               'research_decision':'Conditional rate-to-static reduction verified in scoped fixtures only; preserve old results'}
+          (out/'summary.json').write_text(json.dumps(res,indent=2))
+          print(json.dumps(res,indent=2))
+          PY_FINAL_SUMMARY
+      - name: Upload final evidence including failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: QSEM_Rate_Bridge_Final_Evidence
+          path: out/
+          if-no-files-found: error
+          retention-days: 30
